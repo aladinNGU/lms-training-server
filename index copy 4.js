@@ -51,28 +51,6 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    // ===== EMAIL CONFIGURATION VALIDATION =====
-    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-      console.warn(
-        "⚠️ Email credentials not configured. OTP emails will not be sent.",
-      );
-      console.warn("Please set EMAIL_USER and EMAIL_PASS in your .env file");
-    } else {
-      try {
-        const testTransporter = nodemailer.createTransport({
-          service: "gmail",
-          auth: {
-            user: process.env.EMAIL_USER,
-            pass: process.env.EMAIL_PASS,
-          },
-        });
-        await testTransporter.verify();
-        console.log("✅ Email configuration verified");
-      } catch (emailError) {
-        console.warn("⚠️ Email configuration invalid:", emailError.message);
-      }
-    }
-
     // Connect the client to the server
     await client.connect();
     console.log("Connected to MongoDB");
@@ -259,7 +237,7 @@ async function run() {
             .json({ success: false, message: "Email already exists" });
         }
 
-        // ===== PASSWORD STRENGTH VALIDATION =====
+        // ===== ADD PASSWORD STRENGTH VALIDATION =====
         if (password.length < 6) {
           return res.status(400).json({
             success: false,
@@ -520,14 +498,6 @@ async function run() {
     app.post("/auth/reset-password", async (req, res) => {
       try {
         const { token, newPassword } = req.body;
-
-        // ===== PASSWORD STRENGTH VALIDATION =====
-        if (newPassword.length < 6) {
-          return res.status(400).json({
-            success: false,
-            message: "Password must be at least 6 characters long",
-          });
-        }
 
         // Verify token
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
@@ -1060,55 +1030,6 @@ async function run() {
       },
     );
 
-    // Delete single notification
-    app.delete(
-      "/users/notifications/:notificationId",
-      authenticateToken,
-      async (req, res) => {
-        try {
-          const { notificationId } = req.params;
-          const userId = req.user.userId;
-
-          await userCollection.updateOne(
-            { _id: new ObjectId(userId) },
-            { $pull: { notifications: { _id: new ObjectId(notificationId) } } },
-          );
-
-          res.json({
-            success: true,
-            message: "Notification deleted successfully",
-          });
-        } catch (error) {
-          console.error("Delete notification error:", error);
-          res
-            .status(500)
-            .json({ success: false, message: "Failed to delete notification" });
-        }
-      },
-    );
-
-    // Clear all notifications
-    app.delete("/users/notifications", authenticateToken, async (req, res) => {
-      try {
-        const userId = req.user.userId;
-
-        await userCollection.updateOne(
-          { _id: new ObjectId(userId) },
-          { $set: { notifications: [] } },
-        );
-
-        res.json({
-          success: true,
-          message: "All notifications cleared",
-        });
-      } catch (error) {
-        console.error("Clear notifications error:", error);
-        res
-          .status(500)
-          .json({ success: false, message: "Failed to clear notifications" });
-      }
-    });
-
     // Update user settings
     app.put("/users/settings", authenticateToken, async (req, res) => {
       try {
@@ -1129,70 +1050,6 @@ async function run() {
         res.status(500).json({
           success: false,
           message: "Failed to update settings",
-          error: error.message,
-        });
-      }
-    });
-
-    // Change password (requires authentication)
-    app.post("/auth/change-password", authenticateToken, async (req, res) => {
-      try {
-        const { currentPassword, newPassword } = req.body;
-        const userId = req.user.userId;
-
-        // ===== PASSWORD STRENGTH VALIDATION =====
-        if (newPassword.length < 6) {
-          return res.status(400).json({
-            success: false,
-            message: "New password must be at least 6 characters long",
-          });
-        }
-
-        // Get user
-        const user = await userCollection.findOne({
-          _id: new ObjectId(userId),
-        });
-        if (!user) {
-          return res
-            .status(404)
-            .json({ success: false, message: "User not found" });
-        }
-
-        // Verify current password
-        const isValidPassword = await bcrypt.compare(
-          currentPassword,
-          user.password,
-        );
-        if (!isValidPassword) {
-          return res.status(401).json({
-            success: false,
-            message: "Current password is incorrect",
-          });
-        }
-
-        // Hash new password
-        const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-        // Update password
-        await userCollection.updateOne(
-          { _id: new ObjectId(userId) },
-          {
-            $set: {
-              password: hashedPassword,
-              updatedAt: new Date(),
-            },
-          },
-        );
-
-        res.json({
-          success: true,
-          message: "Password changed successfully",
-        });
-      } catch (error) {
-        console.error("Change password error:", error);
-        res.status(500).json({
-          success: false,
-          message: "Failed to change password",
           error: error.message,
         });
       }
@@ -2323,35 +2180,110 @@ async function run() {
       }
     });
 
-    // Check if course is in wishlist
-    app.get(
-      "/users/wishlist/check/:courseId",
+    // ============= ADD THIS ROUTE =============
+    // Change password (requires authentication)
+    app.post("/auth/change-password", authenticateToken, async (req, res) => {
+      try {
+        const { currentPassword, newPassword } = req.body;
+        const userId = req.user.userId;
+
+        // Get user
+        const user = await userCollection.findOne({
+          _id: new ObjectId(userId),
+        });
+        if (!user) {
+          return res
+            .status(404)
+            .json({ success: false, message: "User not found" });
+        }
+
+        // Verify current password
+        const isValidPassword = await bcrypt.compare(
+          currentPassword,
+          user.password,
+        );
+        if (!isValidPassword) {
+          return res.status(401).json({
+            success: false,
+            message: "Current password is incorrect",
+          });
+        }
+
+        // Hash new password
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+        // Update password
+        await userCollection.updateOne(
+          { _id: new ObjectId(userId) },
+          {
+            $set: {
+              password: hashedPassword,
+              updatedAt: new Date(),
+            },
+          },
+        );
+
+        res.json({
+          success: true,
+          message: "Password changed successfully",
+        });
+      } catch (error) {
+        console.error("Change password error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to change password",
+          error: error.message,
+        });
+      }
+    });
+
+    // Add this route
+    app.delete(
+      "/users/notifications/:notificationId",
       authenticateToken,
       async (req, res) => {
         try {
-          const { courseId } = req.params;
+          const { notificationId } = req.params;
           const userId = req.user.userId;
 
-          const user = await userCollection.findOne({
-            _id: new ObjectId(userId),
-            wishlist: new ObjectId(courseId),
-          });
+          await userCollection.updateOne(
+            { _id: new ObjectId(userId) },
+            { $pull: { notifications: { _id: new ObjectId(notificationId) } } },
+          );
 
           res.json({
             success: true,
-            isInWishlist: !!user,
+            message: "Notification deleted successfully",
           });
         } catch (error) {
-          console.error("Check wishlist error:", error);
-          res.status(500).json({
-            success: false,
-            message: "Failed to check wishlist",
-            error: error.message,
-          });
+          console.error("Delete notification error:", error);
+          res
+            .status(500)
+            .json({ success: false, message: "Failed to delete notification" });
         }
       },
     );
+    // Add this route
+    app.delete("/users/notifications", authenticateToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
 
+        await userCollection.updateOne(
+          { _id: new ObjectId(userId) },
+          { $set: { notifications: [] } },
+        );
+
+        res.json({
+          success: true,
+          message: "All notifications cleared",
+        });
+      } catch (error) {
+        console.error("Clear notifications error:", error);
+        res
+          .status(500)
+          .json({ success: false, message: "Failed to clear notifications" });
+      }
+    });
     // Health check endpoint
     app.get("/health", (req, res) => {
       res.status(200).json({
