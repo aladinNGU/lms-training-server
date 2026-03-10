@@ -701,17 +701,496 @@ async function run() {
       }
     });
 
+    // POST create new lesson
+    app.post("/lessons", async (req, res) => {
+      try {
+        const { chapterId, title, description, order } = req.body;
+
+        // Validate required fields
+        if (!chapterId || !title) {
+          return res.status(400).json({
+            success: false,
+            message: "Chapter ID and title are required",
+          });
+        }
+
+        // Verify chapter exists
+        let chapterQuery;
+        if (ObjectId.isValid(chapterId)) {
+          chapterQuery = { _id: new ObjectId(chapterId) };
+        } else {
+          chapterQuery = { _id: chapterId };
+        }
+
+        const chapter = await db.collection("chapters").findOne(chapterQuery);
+        if (!chapter) {
+          return res.status(404).json({
+            success: false,
+            message: "Chapter not found",
+          });
+        }
+
+        // Get the highest order number for this chapter
+        const lastLesson = await db
+          .collection("lessons")
+          .find({ chapterId: chapter._id })
+          .sort({ order: -1 })
+          .limit(1)
+          .toArray();
+
+        const nextOrder = lastLesson.length > 0 ? lastLesson[0].order + 1 : 1;
+
+        const lessonData = {
+          chapterId: chapter._id,
+          title,
+          description: description || "",
+          order: order || nextOrder,
+          totalTopics: 0,
+          completed: false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await db.collection("lessons").insertOne(lessonData);
+
+        // Update chapter's totalLessons count
+        await db
+          .collection("chapters")
+          .updateOne({ _id: chapter._id }, { $inc: { totalLessons: 1 } });
+
+        // Update course's totalLessons count
+        await db
+          .collection("courses")
+          .updateOne({ _id: chapter.courseId }, { $inc: { totalLessons: 1 } });
+
+        res.status(201).json({
+          success: true,
+          message: "Lesson created successfully",
+          lesson: { ...lessonData, _id: result.insertedId },
+        });
+      } catch (error) {
+        console.error("Create lesson error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to create lesson",
+          error: error.message,
+        });
+      }
+    });
+
+    // PUT update lesson
+    app.put("/lessons/:lessonId", async (req, res) => {
+      try {
+        const { lessonId } = req.params;
+        const { title, description, order } = req.body;
+
+        // Validate ID
+        if (!ObjectId.isValid(lessonId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid lesson ID format",
+          });
+        }
+
+        // Get current lesson to find chapterId for later
+        const currentLesson = await db.collection("lessons").findOne({
+          _id: new ObjectId(lessonId),
+        });
+
+        if (!currentLesson) {
+          return res.status(404).json({
+            success: false,
+            message: "Lesson not found",
+          });
+        }
+
+        const updateData = {
+          ...(title && { title }),
+          ...(description !== undefined && { description }),
+          ...(order && { order: parseInt(order) }),
+          updatedAt: new Date(),
+        };
+
+        const result = await db
+          .collection("lessons")
+          .updateOne({ _id: new ObjectId(lessonId) }, { $set: updateData });
+
+        res.json({
+          success: true,
+          message: "Lesson updated successfully",
+        });
+      } catch (error) {
+        console.error("Update lesson error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to update lesson",
+          error: error.message,
+        });
+      }
+    });
+
+    // DELETE lesson
+    app.delete("/lessons/:lessonId", async (req, res) => {
+      try {
+        const { lessonId } = req.params;
+
+        // Validate ID
+        if (!ObjectId.isValid(lessonId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid lesson ID format",
+          });
+        }
+
+        // Get lesson to find chapterId
+        const lesson = await db.collection("lessons").findOne({
+          _id: new ObjectId(lessonId),
+        });
+
+        if (!lesson) {
+          return res.status(404).json({
+            success: false,
+            message: "Lesson not found",
+          });
+        }
+
+        // Get chapter to find courseId
+        const chapter = await db.collection("chapters").findOne({
+          _id: lesson.chapterId,
+        });
+
+        // Delete all topics in this lesson
+        await db.collection("topics").deleteMany({ lessonId: lesson._id });
+
+        // Delete the lesson
+        const result = await db.collection("lessons").deleteOne({
+          _id: new ObjectId(lessonId),
+        });
+
+        // Update chapter's totalLessons count
+        await db
+          .collection("chapters")
+          .updateOne({ _id: lesson.chapterId }, { $inc: { totalLessons: -1 } });
+
+        // Update course's totalLessons count
+        if (chapter) {
+          await db
+            .collection("courses")
+            .updateOne(
+              { _id: chapter.courseId },
+              { $inc: { totalLessons: -1 } },
+            );
+        }
+
+        res.json({
+          success: true,
+          message: "Lesson and all its topics deleted successfully",
+        });
+      } catch (error) {
+        console.error("Delete lesson error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to delete lesson",
+          error: error.message,
+        });
+      }
+    });
+
+    // POST reorder lessons
+    app.post("/lessons/reorder", async (req, res) => {
+      try {
+        const { lessons } = req.body;
+
+        if (!Array.isArray(lessons)) {
+          return res.status(400).json({
+            success: false,
+            message: "Lessons must be an array",
+          });
+        }
+
+        // Update each lesson's order
+        for (const item of lessons) {
+          await db
+            .collection("lessons")
+            .updateOne(
+              { _id: new ObjectId(item._id) },
+              { $set: { order: item.order, updatedAt: new Date() } },
+            );
+        }
+
+        res.json({
+          success: true,
+          message: "Lessons reordered successfully",
+        });
+      } catch (error) {
+        console.error("Reorder lessons error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to reorder lessons",
+          error: error.message,
+        });
+      }
+    });
     // ============= TOPIC ROUTES =============
-    // GET single topic
+
+    // GET all topics for a lesson
+    app.get("/lessons/:lessonId/topics", async (req, res) => {
+      try {
+        const { lessonId } = req.params;
+        console.log("Fetching topics for lesson:", lessonId);
+
+        let query;
+        if (ObjectId.isValid(lessonId)) {
+          query = { lessonId: new ObjectId(lessonId) };
+        } else {
+          query = { lessonId: lessonId };
+        }
+
+        const topics = await db
+          .collection("topics")
+          .find(query)
+          .sort({ order: 1 })
+          .toArray();
+
+        console.log(`Found ${topics.length} topics`);
+        res.json({ success: true, topics });
+      } catch (error) {
+        console.error("Get topics error:", error);
+        res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // GET single topic by ID
     app.get("/topics/:topicId", async (req, res) => {
       try {
-        const topic = await topicCollection.findOne({
-          _id: new ObjectId(req.params.topicId),
+        const { topicId } = req.params;
+
+        if (!ObjectId.isValid(topicId)) {
+          return res
+            .status(400)
+            .json({ success: false, message: "Invalid topic ID format" });
+        }
+
+        const topic = await db.collection("topics").findOne({
+          _id: new ObjectId(topicId),
         });
+
+        if (!topic) {
+          return res
+            .status(404)
+            .json({ success: false, message: "Topic not found" });
+        }
 
         res.json({ success: true, topic });
       } catch (error) {
+        console.error("Get topic error:", error);
         res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    // POST create new topic
+    app.post("/topics", async (req, res) => {
+      try {
+        const { lessonId, title, content, order } = req.body;
+
+        // Validate required fields
+        if (!lessonId || !title) {
+          return res.status(400).json({
+            success: false,
+            message: "Lesson ID and title are required",
+          });
+        }
+
+        // Verify lesson exists
+        if (!ObjectId.isValid(lessonId)) {
+          return res
+            .status(400)
+            .json({ success: false, message: "Invalid lesson ID format" });
+        }
+
+        const lesson = await db.collection("lessons").findOne({
+          _id: new ObjectId(lessonId),
+        });
+
+        if (!lesson) {
+          return res
+            .status(404)
+            .json({ success: false, message: "Lesson not found" });
+        }
+
+        // Get the highest order number for this lesson
+        const lastTopic = await db
+          .collection("topics")
+          .find({ lessonId: new ObjectId(lessonId) })
+          .sort({ order: -1 })
+          .limit(1)
+          .toArray();
+
+        const nextOrder = lastTopic.length > 0 ? lastTopic[0].order + 1 : 1;
+
+        const topicData = {
+          lessonId: new ObjectId(lessonId),
+          title,
+          content: content || {
+            description: "",
+            contentBlocks: [],
+            duration: "",
+            readingTime: "",
+          },
+          order: order || nextOrder,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await db.collection("topics").insertOne(topicData);
+
+        // Update lesson's totalTopics count
+        await db
+          .collection("lessons")
+          .updateOne(
+            { _id: new ObjectId(lessonId) },
+            { $inc: { totalTopics: 1 } },
+          );
+
+        res.status(201).json({
+          success: true,
+          message: "Topic created successfully",
+          topic: { ...topicData, _id: result.insertedId },
+        });
+      } catch (error) {
+        console.error("Create topic error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to create topic",
+          error: error.message,
+        });
+      }
+    });
+
+    // PUT update topic
+    app.put("/topics/:topicId", async (req, res) => {
+      try {
+        const { topicId } = req.params;
+        const { title, content, order } = req.body;
+
+        // Validate ID
+        if (!ObjectId.isValid(topicId)) {
+          return res
+            .status(400)
+            .json({ success: false, message: "Invalid topic ID format" });
+        }
+
+        const updateData = {
+          ...(title && { title }),
+          ...(content && { content }),
+          ...(order && { order: parseInt(order) }),
+          updatedAt: new Date(),
+        };
+
+        const result = await db
+          .collection("topics")
+          .updateOne({ _id: new ObjectId(topicId) }, { $set: updateData });
+
+        if (result.matchedCount === 0) {
+          return res
+            .status(404)
+            .json({ success: false, message: "Topic not found" });
+        }
+
+        res.json({
+          success: true,
+          message: "Topic updated successfully",
+        });
+      } catch (error) {
+        console.error("Update topic error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to update topic",
+          error: error.message,
+        });
+      }
+    });
+
+    // DELETE topic
+    app.delete("/topics/:topicId", async (req, res) => {
+      try {
+        const { topicId } = req.params;
+
+        // Validate ID
+        if (!ObjectId.isValid(topicId)) {
+          return res
+            .status(400)
+            .json({ success: false, message: "Invalid topic ID format" });
+        }
+
+        // Get topic to find lessonId
+        const topic = await db.collection("topics").findOne({
+          _id: new ObjectId(topicId),
+        });
+
+        if (!topic) {
+          return res
+            .status(404)
+            .json({ success: false, message: "Topic not found" });
+        }
+
+        // Delete the topic
+        const result = await db.collection("topics").deleteOne({
+          _id: new ObjectId(topicId),
+        });
+
+        // Update lesson's totalTopics count
+        await db
+          .collection("lessons")
+          .updateOne({ _id: topic.lessonId }, { $inc: { totalTopics: -1 } });
+
+        res.json({
+          success: true,
+          message: "Topic deleted successfully",
+        });
+      } catch (error) {
+        console.error("Delete topic error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to delete topic",
+          error: error.message,
+        });
+      }
+    });
+
+    // POST reorder topics
+    app.post("/topics/reorder", async (req, res) => {
+      try {
+        const { topics } = req.body;
+
+        if (!Array.isArray(topics)) {
+          return res.status(400).json({
+            success: false,
+            message: "Topics must be an array",
+          });
+        }
+
+        // Update each topic's order
+        for (const item of topics) {
+          await db
+            .collection("topics")
+            .updateOne(
+              { _id: new ObjectId(item._id) },
+              { $set: { order: item.order, updatedAt: new Date() } },
+            );
+        }
+
+        res.json({
+          success: true,
+          message: "Topics reordered successfully",
+        });
+      } catch (error) {
+        console.error("Reorder topics error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to reorder topics",
+          error: error.message,
+        });
       }
     });
 
