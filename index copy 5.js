@@ -95,6 +95,8 @@ async function run() {
     await lessonCollection.createIndex({ chapterId: 1, order: 1 });
     await topicCollection.createIndex({ lessonId: 1, order: 1 });
 
+    console.log("Database indexes created");
+
     // Create indexes for user collections
     await userCollection.createIndex({ email: 1 }, { unique: true });
     await userCollection.createIndex({ uniqueId: 1 }, { unique: true });
@@ -108,9 +110,6 @@ async function run() {
       { certificateId: 1 },
       { unique: true },
     );
-    await userCollection.createIndex({ "notifications.createdAt": -1 });
-
-    console.log("Database indexes created");
 
     // ============= AUTHENTICATION MIDDLEWARE =============
     // Middleware to authenticate token
@@ -164,72 +163,7 @@ async function run() {
       },
     });
 
-    // ============= NOTIFICATION SERVICE =============
-    const notificationService = {
-      // Send notification to a single user
-      sendToUser: async (userId, notification) => {
-        try {
-          const notificationWithId = {
-            ...notification,
-            _id: new ObjectId(),
-            createdAt: new Date(),
-            read: false,
-          };
-
-          await userCollection.updateOne(
-            { _id: new ObjectId(userId) },
-            { $push: { notifications: notificationWithId } },
-          );
-
-          // Optional: Emit socket event for real-time notification
-          // io.to(userId).emit('new-notification', notificationWithId);
-
-          return notificationWithId;
-        } catch (error) {
-          console.error("Send notification error:", error);
-        }
-      },
-
-      // Send notification to multiple users
-      sendToMany: async (userIds, notification) => {
-        try {
-          const notificationWithId = {
-            ...notification,
-            _id: new ObjectId(),
-            createdAt: new Date(),
-            read: false,
-          };
-
-          await userCollection.updateMany(
-            { _id: { $in: userIds.map((id) => new ObjectId(id)) } },
-            { $push: { notifications: notificationWithId } },
-          );
-
-          return notificationWithId;
-        } catch (error) {
-          console.error("Send bulk notifications error:", error);
-        }
-      },
-
-      // Send to all students enrolled in a course
-      sendToCourseStudents: async (courseId, notification) => {
-        try {
-          const students = await userCollection
-            .find({
-              "enrolledCourses.courseId": new ObjectId(courseId),
-            })
-            .toArray();
-
-          const studentIds = students.map((s) => s._id);
-
-          return await notificationService.sendToMany(studentIds, notification);
-        } catch (error) {
-          console.error("Send to course students error:", error);
-        }
-      },
-    };
-
-    // Helper function to handle course completion (UPDATED WITH NOTIFICATION)
+    // Helper function to handle course completion
     async function handleCourseCompletion(userId, courseId) {
       const user = await userCollection.findOne({ _id: new ObjectId(userId) });
       const course = await courseCollection.findOne({
@@ -279,13 +213,20 @@ async function run() {
         },
       );
 
-      // ===== ENHANCED NOTIFICATION =====
-      await notificationService.sendToUser(userId, {
-        type: "achievement",
-        message: `🏆 Congratulations! You've completed '${course.title}'`,
-        details: "Your certificate is now available in your profile",
-        actionUrl: "/certificates",
-      });
+      // Send notification
+      await userCollection.updateOne(
+        { _id: new ObjectId(userId) },
+        {
+          $push: {
+            notifications: {
+              type: "course",
+              message: `Congratulations! You've completed ${course.title}`,
+              read: false,
+              createdAt: new Date(),
+            },
+          },
+        },
+      );
 
       return certificate;
     }
@@ -682,7 +623,7 @@ async function run() {
 
     // ============= COURSE ENROLLMENT ROUTES =============
 
-    // Enroll in a course (UPDATED WITH NOTIFICATION)
+    // Enroll in a course
     app.post("/users/enroll/:courseId", authenticateToken, async (req, res) => {
       try {
         const { courseId } = req.params;
@@ -751,14 +692,6 @@ async function run() {
           { _id: new ObjectId(userId) },
           { $push: { enrolledCourses: enrollmentData } },
         );
-
-        // ===== ADD NOTIFICATION =====
-        await notificationService.sendToUser(userId, {
-          type: "course",
-          message: `You have successfully enrolled in '${course.title}'`,
-          details: "Start your learning journey today!",
-          actionUrl: `/course/${course.slug || courseId}`,
-        });
 
         res.json({
           success: true,
@@ -1073,56 +1006,17 @@ async function run() {
       }
     });
 
-    // Check if course is in wishlist
-    app.get(
-      "/users/wishlist/check/:courseId",
-      authenticateToken,
-      async (req, res) => {
-        try {
-          const { courseId } = req.params;
-          const userId = req.user.userId;
-
-          const user = await userCollection.findOne({
-            _id: new ObjectId(userId),
-            wishlist: new ObjectId(courseId),
-          });
-
-          res.json({
-            success: true,
-            isInWishlist: !!user,
-          });
-        } catch (error) {
-          console.error("Check wishlist error:", error);
-          res.status(500).json({
-            success: false,
-            message: "Failed to check wishlist",
-            error: error.message,
-          });
-        }
-      },
-    );
-
-    // In your backend/index.js, find the notifications route and update it:
-
-    // Get user notifications (OPTIMIZED)
+    // Get user notifications
     app.get("/users/notifications", authenticateToken, async (req, res) => {
       try {
-        const userId = req.user.userId;
-
-        // Only fetch the notifications field, not the entire user document
         const user = await userCollection.findOne(
-          { _id: new ObjectId(userId) },
-          { projection: { notifications: 1 } }, // Only get notifications
-        );
-
-        // Return notifications sorted by date (newest first)
-        const notifications = (user?.notifications || []).sort(
-          (a, b) => new Date(b.createdAt) - new Date(a.createdAt),
+          { _id: new ObjectId(req.user.userId) },
+          { projection: { notifications: 1 } },
         );
 
         res.json({
           success: true,
-          notifications: notifications,
+          notifications: user.notifications || [],
         });
       } catch (error) {
         console.error("Get notifications error:", error);
@@ -1361,7 +1255,7 @@ async function run() {
       }
     });
 
-    // GET single course by ID
+    // GET single course by ID (NEW ROUTE)
     app.get("/courses/id/:id", async (req, res) => {
       try {
         const { id } = req.params;
@@ -1597,6 +1491,7 @@ async function run() {
       }
     });
 
+    // ============= NEW CHAPTER ROUTES =============
     // GET single chapter by ID
     app.get("/chapters/:chapterId", async (req, res) => {
       try {
@@ -1893,41 +1788,6 @@ async function run() {
       }
     });
 
-    // GET all lessons (with optional filtering)
-    app.get("/lessons", async (req, res) => {
-      try {
-        const { chapterId } = req.query;
-        let query = {};
-
-        // If chapterId is provided, filter by it
-        if (chapterId) {
-          if (ObjectId.isValid(chapterId)) {
-            query = { chapterId: new ObjectId(chapterId) };
-          } else {
-            // Try to find chapter by slug
-            const chapter = await db
-              .collection("chapters")
-              .findOne({ slug: chapterId });
-            if (chapter) {
-              query = { chapterId: chapter._id };
-            }
-          }
-        }
-
-        const lessons = await db
-          .collection("lessons")
-          .find(query)
-          .sort({ order: 1 })
-          .toArray();
-
-        console.log(`Found ${lessons.length} lessons`);
-        res.json({ success: true, lessons });
-      } catch (error) {
-        console.error("Get all lessons error:", error);
-        res.status(500).json({ success: false, error: error.message });
-      }
-    });
-
     // GET single lesson with its topics
     app.get("/lessons/:lessonId", async (req, res) => {
       try {
@@ -1970,7 +1830,7 @@ async function run() {
       }
     });
 
-    // POST create new lesson (UPDATED WITH NOTIFICATION)
+    // POST create new lesson
     app.post("/lessons", async (req, res) => {
       try {
         const { chapterId, title, description, order } = req.body;
@@ -2031,17 +1891,6 @@ async function run() {
         await db
           .collection("courses")
           .updateOne({ _id: chapter.courseId }, { $inc: { totalLessons: 1 } });
-
-        // ===== ADD NOTIFICATION TO ALL ENROLLED STUDENTS =====
-        const course = await courseCollection.findOne({
-          _id: chapter.courseId,
-        });
-        await notificationService.sendToCourseStudents(chapter.courseId, {
-          type: "course",
-          message: `📚 New lesson available: '${title}'`,
-          details: `Check out the new content in ${course.title}`,
-          actionUrl: `/course/${course.slug || chapter.courseId}`,
-        });
 
         res.status(201).json({
           success: true,
@@ -2211,7 +2060,6 @@ async function run() {
         });
       }
     });
-
     // ============= TOPIC ROUTES =============
 
     // GET all topics for a lesson
@@ -2475,105 +2323,144 @@ async function run() {
       }
     });
 
-    // ============= INSTRUCTOR ANNOUNCEMENT ROUTE =============
-    // Send announcement to all enrolled students
-    app.post(
-      "/courses/:courseId/announcement",
+    // Check if course is in wishlist
+    app.get(
+      "/users/wishlist/check/:courseId",
       authenticateToken,
       async (req, res) => {
         try {
           const { courseId } = req.params;
-          const { title, message } = req.body;
           const userId = req.user.userId;
 
-          // Check if user is instructor or admin
           const user = await userCollection.findOne({
             _id: new ObjectId(userId),
-          });
-          if (user.role !== "instructor" && user.role !== "admin") {
-            return res.status(403).json({
-              success: false,
-              message:
-                "Unauthorized: Only instructors and admins can send announcements",
-            });
-          }
-
-          // Get course details
-          const course = await courseCollection.findOne({
-            _id: new ObjectId(courseId),
-          });
-
-          if (!course) {
-            return res.status(404).json({
-              success: false,
-              message: "Course not found",
-            });
-          }
-
-          // Validate input
-          if (!title || !message) {
-            return res.status(400).json({
-              success: false,
-              message: "Title and message are required",
-            });
-          }
-
-          // Send announcement to all enrolled students
-          await notificationService.sendToCourseStudents(courseId, {
-            type: "announcement",
-            message: `📢 ${title}`,
-            details: message,
-            actionUrl: `/course/${course.slug || courseId}/announcements`,
+            wishlist: new ObjectId(courseId),
           });
 
           res.json({
             success: true,
-            message: "Announcement sent successfully to all enrolled students",
+            isInWishlist: !!user,
           });
         } catch (error) {
-          console.error("Send announcement error:", error);
+          console.error("Check wishlist error:", error);
           res.status(500).json({
             success: false,
-            message: "Failed to send announcement",
+            message: "Failed to check wishlist",
             error: error.message,
           });
         }
       },
     );
 
-    // Get enrolled students count for a course
-    // Get enrolled students count for a course
-    app.get("/courses/:courseId/enrolled-count", async (req, res) => {
-      try {
-        const { courseId } = req.params;
+    // ============= NOTIFICATION SERVICE =============
+    const notificationService = {
+      // Send notification to a single user
+      sendToUser: async (userId, notification) => {
+        try {
+          const notificationWithId = {
+            ...notification,
+            _id: new ObjectId(),
+            createdAt: new Date(),
+            read: false,
+          };
 
-        // Validate courseId
-        if (!ObjectId.isValid(courseId)) {
-          return res.status(400).json({
-            success: false,
-            message: "Invalid course ID format",
-          });
+          await userCollection.updateOne(
+            { _id: new ObjectId(userId) },
+            { $push: { notifications: notificationWithId } },
+          );
+
+          // Optional: Emit socket event for real-time notification
+          // io.to(userId).emit('new-notification', notificationWithId);
+
+          return notificationWithId;
+        } catch (error) {
+          console.error("Send notification error:", error);
         }
+      },
 
-        // Count users who have this course in their enrolledCourses
-        const count = await db.collection("users").countDocuments({
-          "enrolledCourses.courseId": new ObjectId(courseId),
-        });
+      // Send notification to multiple users
+      sendToMany: async (userIds, notification) => {
+        try {
+          const notificationWithId = {
+            ...notification,
+            _id: new ObjectId(),
+            createdAt: new Date(),
+            read: false,
+          };
 
-        res.json({
-          success: true,
-          count: count,
-        });
-      } catch (error) {
-        console.error("Get enrolled count error:", error);
-        res.status(500).json({
-          success: false,
-          message: "Failed to get enrolled count",
-          error: error.message,
-        });
-      }
-    });
+          await userCollection.updateMany(
+            { _id: { $in: userIds.map((id) => new ObjectId(id)) } },
+            { $push: { notifications: notificationWithId } },
+          );
 
+          return notificationWithId;
+        } catch (error) {
+          console.error("Send bulk notifications error:", error);
+        }
+      },
+
+      // Send to all students enrolled in a course
+      sendToCourseStudents: async (courseId, notification) => {
+        try {
+          const students = await userCollection
+            .find({
+              "enrolledCourses.courseId": new ObjectId(courseId),
+            })
+            .toArray();
+
+          const studentIds = students.map((s) => s._id);
+
+          return await notificationService.sendToMany(studentIds, notification);
+        } catch (error) {
+          console.error("Send to course students error:", error);
+        }
+      },
+
+      // Mark notification as read
+      markAsRead: async (userId, notificationId) => {
+        try {
+          await userCollection.updateOne(
+            {
+              _id: new ObjectId(userId),
+              "notifications._id": new ObjectId(notificationId),
+            },
+            { $set: { "notifications.$.read": true } },
+          );
+          return true;
+        } catch (error) {
+          console.error("Mark as read error:", error);
+          return false;
+        }
+      },
+
+      // Delete notification
+      deleteNotification: async (userId, notificationId) => {
+        try {
+          await userCollection.updateOne(
+            { _id: new ObjectId(userId) },
+            { $pull: { notifications: { _id: new ObjectId(notificationId) } } },
+          );
+          return true;
+        } catch (error) {
+          console.error("Delete notification error:", error);
+          return false;
+        }
+      },
+
+      // Clear all notifications
+      clearAll: async (userId) => {
+        try {
+          await userCollection.updateOne(
+            { _id: new ObjectId(userId) },
+            { $set: { notifications: [] } },
+          );
+          return true;
+        } catch (error) {
+          console.error("Clear all notifications error:", error);
+          return false;
+        }
+      },
+    };
     // Health check endpoint
     app.get("/health", (req, res) => {
       res.status(200).json({
