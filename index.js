@@ -146,6 +146,73 @@ async function run() {
     await emailLogCollection.createIndex({ sentAt: -1 });
     console.log("✅ Email logs indexes created");
 
+    // Middleware to check if user is admin
+    // ============= FIXED isAdmin MIDDLEWARE =============
+    // ============= IMPROVED isAdmin MIDDLEWARE =============
+    async function isAdmin(req, res, next) {
+      try {
+        // Check if req.user exists
+        if (!req.user) {
+          console.error("❌ isAdmin: No user object in request");
+          return res.status(401).json({
+            success: false,
+            message: "Authentication required",
+          });
+        }
+
+        const userId = req.user.userId;
+
+        console.log("🔍 isAdmin checking userId:", userId);
+
+        // Validate userId exists
+        if (!userId) {
+          console.error("❌ isAdmin: No userId in token");
+          return res.status(400).json({
+            success: false,
+            message: "Invalid token: No user ID",
+          });
+        }
+
+        // Validate userId format
+        if (!ObjectId.isValid(userId)) {
+          console.error("❌ isAdmin: Invalid userId format:", userId);
+          return res.status(400).json({
+            success: false,
+            message: "Invalid user ID format in token",
+          });
+        }
+
+        const user = await userCollection.findOne({
+          _id: new ObjectId(userId),
+        });
+
+        if (!user) {
+          console.error("❌ isAdmin: User not found for ID:", userId);
+          return res.status(404).json({
+            success: false,
+            message: "User not found",
+          });
+        }
+
+        if (user.role !== "admin") {
+          console.error("❌ isAdmin: User is not admin. Role:", user.role);
+          return res.status(403).json({
+            success: false,
+            message: "Admin access required",
+          });
+        }
+
+        console.log("✅ isAdmin: User authorized as admin:", user.email);
+        next();
+      } catch (error) {
+        console.error("❌ isAdmin middleware error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Authorization error",
+          error: error.message,
+        });
+      }
+    }
     // ============= AUTHENTICATION MIDDLEWARE =============
     // Middleware to authenticate token
     function authenticateToken(req, res, next) {
@@ -344,6 +411,594 @@ async function run() {
 
       return lessons.map((l) => l._id);
     }
+
+    // TEMPORARY DEBUG ROUTE - Add this before your stats route
+    app.get("/admin/debug/token", authenticateToken, async (req, res) => {
+      try {
+        console.log("🔍 Debug: Token user data:", req.user);
+
+        // Check if userId exists and is valid
+        const userId = req.user?.userId;
+        const isValid = userId ? ObjectId.isValid(userId) : false;
+
+        res.json({
+          success: true,
+          debug: {
+            userId: userId,
+            isValid: isValid,
+            user: req.user,
+          },
+        });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // 7. GET user statistics for dashboard
+    // 7. GET user statistics for dashboard (FIXED)
+    // ============= FIXED USER STATS ROUTE =============
+    // 7. GET user statistics for dashboard
+    // 7. GET user statistics for dashboard (FIXED WITH ERROR HANDLING)
+    // ============= FIXED USER STATS ROUTE =============
+    // ============= IMPROVED USER STATS ROUTE =============
+    app.get(
+      "/admin/users/stats",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          console.log("📊 Fetching user statistics...");
+
+          // Verify userCollection exists
+          if (!userCollection) {
+            console.error("❌ userCollection is not defined!");
+            return res.status(500).json({
+              success: false,
+              message: "Database collection not initialized",
+            });
+          }
+
+          // Get total users count
+          const totalUsers = await userCollection.countDocuments();
+          console.log(`✅ Total users found: ${totalUsers}`);
+
+          // Get counts by status
+          let activeUsers = 0,
+            suspendedUsers = 0,
+            blockedUsers = 0,
+            inactiveUsers = 0;
+
+          try {
+            activeUsers =
+              (await userCollection.countDocuments({ status: "active" })) || 0;
+            suspendedUsers =
+              (await userCollection.countDocuments({ status: "suspended" })) ||
+              0;
+            blockedUsers =
+              (await userCollection.countDocuments({ status: "blocked" })) || 0;
+            inactiveUsers =
+              (await userCollection.countDocuments({ status: "inactive" })) ||
+              0;
+          } catch (statusError) {
+            console.log("⚠️ Status field may not exist, using defaults");
+            activeUsers = totalUsers;
+          }
+
+          // Get counts by role
+          let adminCount = 0,
+            instructorCount = 0,
+            studentCount = 0;
+
+          try {
+            adminCount =
+              (await userCollection.countDocuments({ role: "admin" })) || 0;
+            instructorCount =
+              (await userCollection.countDocuments({ role: "instructor" })) ||
+              0;
+            studentCount =
+              (await userCollection.countDocuments({ role: "student" })) || 0;
+          } catch (roleError) {
+            console.log("⚠️ Role field may not exist");
+          }
+
+          const stats = {
+            total: totalUsers,
+            active: activeUsers,
+            suspended: suspendedUsers,
+            blocked: blockedUsers,
+            inactive: inactiveUsers,
+            byRole: [
+              { _id: "admin", count: adminCount },
+              { _id: "instructor", count: instructorCount },
+              { _id: "student", count: studentCount },
+            ],
+          };
+
+          console.log("✅ Stats calculated:", stats);
+
+          res.json({
+            success: true,
+            stats: stats,
+          });
+        } catch (error) {
+          console.error("❌ Get user stats error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to fetch user statistics",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // 1. GET all users with pagination and filters
+    // 1. GET all users with pagination and filters (UPDATED)
+    // ============= GET ALL USERS WITH STATS =============
+    // ============= GET ALL USERS WITH STATS =============
+    app.get("/admin/users", authenticateToken, isAdmin, async (req, res) => {
+      try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const skip = (page - 1) * limit;
+        const { role, status, search } = req.query;
+
+        // Build filter query
+        let query = {};
+        if (role && role !== "all") query.role = role;
+        if (status && status !== "all") query.status = status;
+        if (search) {
+          query.$or = [
+            { name: { $regex: search, $options: "i" } },
+            { email: { $regex: search, $options: "i" } },
+            { uniqueId: { $regex: search, $options: "i" } },
+          ];
+        }
+
+        console.log("🔍 Fetching users with query:", JSON.stringify(query));
+
+        // Get total count for pagination
+        const total = await userCollection.countDocuments(query);
+
+        // Get users with selected fields only
+        const users = await userCollection
+          .find(query, {
+            projection: {
+              password: 0,
+              notifications: 0,
+              settings: 0,
+            },
+          })
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+
+        console.log(`✅ Found ${users.length} users`);
+
+        // Get enrollment and payment stats for each user
+        const usersWithStats = await Promise.all(
+          users.map(async (user) => {
+            // Ensure status field exists
+            if (!user.status) {
+              user.status = "active";
+            }
+
+            // Get enrolled courses count
+            const enrolledCount = user.enrolledCourses?.length || 0;
+
+            // Get completed courses count
+            const completedCount =
+              user.enrolledCourses?.filter((c) => c && c.status === "completed")
+                .length || 0;
+
+            // Get payment count
+            let payments = 0;
+            try {
+              payments =
+                (await paymentCollection.countDocuments({
+                  userId: user._id,
+                  status: "COMPLETED",
+                })) || 0;
+            } catch (e) {
+              console.log(
+                `No payment collection or no payments for user ${user._id}`,
+              );
+            }
+
+            return {
+              ...user,
+              stats: {
+                enrolledCourses: enrolledCount,
+                completedCourses: completedCount,
+                totalPayments: payments,
+              },
+            };
+          }),
+        );
+
+        res.json({
+          success: true,
+          users: usersWithStats,
+          pagination: {
+            page,
+            limit,
+            total,
+            pages: Math.ceil(total / limit),
+          },
+        });
+      } catch (error) {
+        console.error("❌ Get users error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch users",
+          error: error.message,
+        });
+      }
+    });
+
+    // 6. BULK user operations
+    app.post(
+      "/admin/users/bulk-action",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const { action, userIds, data } = req.body;
+
+          if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+            return res.status(400).json({
+              success: false,
+              message: "No users selected",
+            });
+          }
+
+          const objectIds = userIds.map((id) => new ObjectId(id));
+
+          let result;
+          switch (action) {
+            case "delete":
+              result = await userCollection.deleteMany({
+                _id: { $in: objectIds },
+              });
+              break;
+
+            case "changeRole":
+              if (!data?.role) {
+                return res.status(400).json({
+                  success: false,
+                  message: "Role is required",
+                });
+              }
+              result = await userCollection.updateMany(
+                { _id: { $in: objectIds } },
+                { $set: { role: data.role, updatedAt: new Date() } },
+              );
+              break;
+
+            case "changeStatus":
+              if (!data?.status) {
+                return res.status(400).json({
+                  success: false,
+                  message: "Status is required",
+                });
+              }
+              result = await userCollection.updateMany(
+                { _id: { $in: objectIds } },
+                { $set: { status: data.status, updatedAt: new Date() } },
+              );
+              break;
+
+            default:
+              return res.status(400).json({
+                success: false,
+                message: "Invalid action",
+              });
+          }
+
+          res.json({
+            success: true,
+            message: `Bulk action completed: ${result.modifiedCount} users affected`,
+            modifiedCount: result.modifiedCount,
+          });
+        } catch (error) {
+          console.error("Bulk action error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to perform bulk action",
+          });
+        }
+      },
+    );
+
+    // ============= ADD EMAIL LOGS ROUTE (Admin only) =============
+    app.get("/admin/email-logs", authenticateToken, async (req, res) => {
+      try {
+        // Check if user is admin
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+        if (user.role !== "admin") {
+          return res
+            .status(403)
+            .json({ success: false, message: "Admin access required" });
+        }
+
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const skip = (page - 1) * limit;
+
+        const logs = await emailLogCollection
+          .find({})
+          .sort({ sentAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+
+        const total = await emailLogCollection.countDocuments();
+
+        res.json({
+          success: true,
+          logs,
+          pagination: {
+            page,
+            limit,
+            total,
+            pages: Math.ceil(total / limit),
+          },
+        });
+      } catch (error) {
+        console.error("Get email logs error:", error);
+        res
+          .status(500)
+          .json({ success: false, message: "Failed to get email logs" });
+      }
+    });
+
+    // ============= ADMIN USER MANAGEMENT ROUTES =============
+
+    // 2. GET single user details with full info
+    // ============= FIXED GET SINGLE USER DETAILS ROUTE =============
+    app.get(
+      "/admin/users/:userId",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const { userId } = req.params;
+
+          console.log("🔍 Fetching user details for ID:", userId);
+
+          // Validate if userId is a valid ObjectId
+          if (!ObjectId.isValid(userId)) {
+            console.log("❌ Invalid user ID format:", userId);
+            return res.status(400).json({
+              success: false,
+              message: "Invalid user ID format",
+            });
+          }
+
+          const user = await userCollection.findOne(
+            { _id: new ObjectId(userId) },
+            { projection: { password: 0 } },
+          );
+
+          if (!user) {
+            return res.status(404).json({
+              success: false,
+              message: "User not found",
+            });
+          }
+
+          // Get user's payments
+          const payments = await paymentCollection
+            .find({ userId: new ObjectId(userId) })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+          // Get user's enrolled courses with details
+          const enrolledCourses = await Promise.all(
+            (user.enrolledCourses || []).map(async (enrollment) => {
+              const course = await courseCollection.findOne(
+                { _id: enrollment.courseId },
+                { projection: { title: 1, thumbnail: 1, price: 1 } },
+              );
+              return {
+                ...enrollment,
+                courseDetails: course,
+              };
+            }),
+          );
+
+          res.json({
+            success: true,
+            user: {
+              ...user,
+              payments,
+              enrolledCourses,
+            },
+          });
+        } catch (error) {
+          console.error("Get user details error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to fetch user details",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // 3. UPDATE user role
+    app.put(
+      "/admin/users/:userId/role",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const { userId } = req.params;
+          const { role } = req.body;
+
+          if (!["student", "instructor", "admin"].includes(role)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid role",
+            });
+          }
+
+          const result = await userCollection.updateOne(
+            { _id: new ObjectId(userId) },
+            {
+              $set: {
+                role,
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+          if (result.matchedCount === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "User not found",
+            });
+          }
+
+          // Log the action
+          console.log(
+            `User ${userId} role changed to ${role} by admin ${req.user.userId}`,
+          );
+
+          res.json({
+            success: true,
+            message: "User role updated successfully",
+          });
+        } catch (error) {
+          console.error("Update user role error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to update user role",
+          });
+        }
+      },
+    );
+
+    // 4. UPDATE user status (active/suspended/blocked)
+    app.put(
+      "/admin/users/:userId/status",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const { userId } = req.params;
+          const { status } = req.body;
+
+          if (
+            !["active", "suspended", "blocked", "inactive"].includes(status)
+          ) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid status",
+            });
+          }
+
+          const result = await userCollection.updateOne(
+            { _id: new ObjectId(userId) },
+            {
+              $set: {
+                status,
+                updatedAt: new Date(),
+                ...(status === "blocked" ? { blockedAt: new Date() } : {}),
+              },
+            },
+          );
+
+          if (result.matchedCount === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "User not found",
+            });
+          }
+
+          res.json({
+            success: true,
+            message: `User ${status} successfully`,
+          });
+        } catch (error) {
+          console.error("Update user status error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to update user status",
+          });
+        }
+      },
+    );
+
+    // 5. DELETE user (cascade delete)
+    app.delete(
+      "/admin/users/:userId",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const { userId } = req.params;
+
+          // Start a session for transaction
+          const session = client.startSession();
+
+          try {
+            await session.withTransaction(async () => {
+              // Get user first to find related data
+              const user = await userCollection.findOne({
+                _id: new ObjectId(userId),
+              });
+
+              if (!user) {
+                throw new Error("User not found");
+              }
+
+              // 1. Delete user's payments
+              await paymentCollection.deleteMany(
+                { userId: new ObjectId(userId) },
+                { session },
+              );
+
+              // 2. Delete user's certificates
+              await certificateCollection.deleteMany(
+                { userId: new ObjectId(userId) },
+                { session },
+              );
+
+              // 3. Remove user from any course analytics (optional)
+              // ... any other cleanup
+
+              // 4. Finally delete the user
+              await userCollection.deleteOne(
+                { _id: new ObjectId(userId) },
+                { session },
+              );
+
+              console.log(
+                `User ${userId} and all related data deleted by admin ${req.user.userId}`,
+              );
+            });
+
+            await session.commitTransaction();
+
+            res.json({
+              success: true,
+              message: "User and all related data deleted successfully",
+            });
+          } finally {
+            await session.endSession();
+          }
+        } catch (error) {
+          console.error("Delete user error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to delete user",
+          });
+        }
+      },
+    );
 
     // ============= AUTH ROUTES =============
 
@@ -668,22 +1323,61 @@ async function run() {
     // ============= USER PROFILE ROUTES =============
 
     // Get user profile
+    // ============= OPTIMIZED USER PROFILE ROUTE =============
     app.get("/users/profile", authenticateToken, async (req, res) => {
       try {
+        const userId = req.user.userId;
+
+        console.log("📋 Fetching profile for user:", userId);
+
+        // Validate userId
+        if (!ObjectId.isValid(userId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid user ID format",
+          });
+        }
+
+        // Use projection to only get needed fields
         const user = await userCollection.findOne(
-          { _id: new ObjectId(req.user.userId) },
-          { projection: { password: 0 } },
+          { _id: new ObjectId(userId) },
+          {
+            projection: {
+              password: 0,
+              notifications: 0,
+              // Add other fields you don't need in profile
+            },
+          },
         );
 
         if (!user) {
-          return res
-            .status(404)
-            .json({ success: false, message: "User not found" });
+          return res.status(404).json({
+            success: false,
+            message: "User not found",
+          });
         }
 
-        res.json({ success: true, user });
+        console.log("✅ Profile fetched successfully for:", user.email);
+
+        res.json({
+          success: true,
+          user: {
+            ...user,
+            // Ensure these fields exist
+            name: user.name || "",
+            email: user.email || "",
+            role: user.role || "student",
+            uniqueId: user.uniqueId || "",
+            profile: user.profile || {},
+            enrolledCourses: user.enrolledCourses || [],
+            wishlist: user.wishlist || [],
+            settings: user.settings || {},
+            createdAt: user.createdAt,
+            lastLogin: user.lastLogin,
+          },
+        });
       } catch (error) {
-        console.error("Get profile error:", error);
+        console.error("❌ Get profile error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch profile",
@@ -3771,50 +4465,6 @@ async function run() {
     //       },
     //     );
 
-    // ============= ADD EMAIL LOGS ROUTE (Admin only) =============
-    app.get("/admin/email-logs", authenticateToken, async (req, res) => {
-      try {
-        // Check if user is admin
-        const user = await userCollection.findOne({
-          _id: new ObjectId(req.user.userId),
-        });
-        if (user.role !== "admin") {
-          return res
-            .status(403)
-            .json({ success: false, message: "Admin access required" });
-        }
-
-        const page = parseInt(req.query.page) || 1;
-        const limit = parseInt(req.query.limit) || 20;
-        const skip = (page - 1) * limit;
-
-        const logs = await emailLogCollection
-          .find({})
-          .sort({ sentAt: -1 })
-          .skip(skip)
-          .limit(limit)
-          .toArray();
-
-        const total = await emailLogCollection.countDocuments();
-
-        res.json({
-          success: true,
-          logs,
-          pagination: {
-            page,
-            limit,
-            total,
-            pages: Math.ceil(total / limit),
-          },
-        });
-      } catch (error) {
-        console.error("Get email logs error:", error);
-        res
-          .status(500)
-          .json({ success: false, message: "Failed to get email logs" });
-      }
-    });
-
     // ============= PDF GENERATION WITH PDFKIT =============
 
     // Helper function to format date
@@ -4326,6 +4976,7 @@ Course: ${course?.title || "N/A"}
         }
       },
     );
+
     // Health check endpoint
     app.get("/health", (req, res) => {
       res.status(200).json({
