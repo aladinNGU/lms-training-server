@@ -8,6 +8,7 @@ const axios = require("axios");
 const crypto = require("crypto");
 const { MongoClient, ObjectId, ServerApiVersion } = require("mongodb");
 require("dotenv").config();
+const PDFDocument = require("pdfkit");
 
 const app = express();
 const PORT = process.env.PORT || 7000;
@@ -98,6 +99,7 @@ async function run() {
     const otpCollection = db.collection("otp");
     const certificateCollection = db.collection("certificates");
     const paymentCollection = db.collection("payments");
+    const emailLogCollection = db.collection("emailLogs");
 
     // Create indexes for better performance
     await courseCollection.createIndex({ slug: 1 }, { unique: true });
@@ -123,6 +125,8 @@ async function run() {
     );
     await userCollection.createIndex({ "notifications.createdAt": -1 });
 
+    console.log("Database indexes created");
+
     await paymentCollection.createIndex(
       { trxID: 1 },
       { unique: true, sparse: true },
@@ -136,7 +140,11 @@ async function run() {
     await paymentCollection.createIndex({ courseId: 1 });
     console.log("Payment indexes created");
 
-    console.log("Database indexes created");
+    // Create indexes for email logs collection
+    await emailLogCollection.createIndex({ userId: 1 });
+    await emailLogCollection.createIndex({ merchantInvoiceNumber: 1 });
+    await emailLogCollection.createIndex({ sentAt: -1 });
+    console.log("✅ Email logs indexes created");
 
     // ============= AUTHENTICATION MIDDLEWARE =============
     // Middleware to authenticate token
@@ -1015,6 +1023,7 @@ async function run() {
     );
 
     // Get user's enrolled courses with progress
+    // Get user's enrolled courses with progress
     app.get("/users/my-courses", authenticateToken, async (req, res) => {
       try {
         const user = await userCollection.findOne(
@@ -1034,19 +1043,30 @@ async function run() {
                   thumbnail: 1,
                   level: 1,
                   duration: 1,
+                  slug: 1,
+                  totalChapters: 1,
+                  totalLessons: 1,
+                  totalTopics: 1,
                 },
               },
             );
+
+            if (!course) return null;
+
             return {
               ...course,
               enrollment: enrollment,
+              _id: course._id, // Make sure ID is included
             };
           }),
         );
 
+        // Filter out any null values (courses that might have been deleted)
+        const validCourses = coursesWithProgress.filter((c) => c !== null);
+
         res.json({
           success: true,
-          courses: coursesWithProgress,
+          courses: validCourses,
         });
       } catch (error) {
         console.error("Get my courses error:", error);
@@ -1586,6 +1606,7 @@ async function run() {
     });
 
     // PUT update course
+    // PUT update course (COMPLETE FIX)
     app.put("/courses/:id", async (req, res) => {
       try {
         const { id } = req.params;
@@ -1599,11 +1620,21 @@ async function run() {
           status,
         } = req.body;
 
-        // Validate ID
-        if (!ObjectId.isValid(id)) {
-          return res.status(400).json({
+        console.log("Updating course with identifier:", id);
+
+        // Find the course
+        let course;
+        if (ObjectId.isValid(id)) {
+          course = await courseCollection.findOne({ _id: new ObjectId(id) });
+        }
+        if (!course) {
+          course = await courseCollection.findOne({ slug: id });
+        }
+
+        if (!course) {
+          return res.status(404).json({
             success: false,
-            message: "Invalid course ID format",
+            message: "Course not found",
           });
         }
 
@@ -1618,26 +1649,50 @@ async function run() {
           updatedAt: new Date(),
         };
 
-        // If title is updated, update slug as well
-        if (title) {
-          updateData.slug = await createUniqueSlug(title, courseCollection);
+        // Handle slug update only if title changed
+        if (title && title !== course.title) {
+          const newSlug = generateSlug(title);
+
+          // Check if slug exists for a DIFFERENT course
+          const existingCourse = await courseCollection.findOne({
+            slug: newSlug,
+            _id: { $ne: course._id },
+          });
+
+          if (existingCourse) {
+            // Make slug unique
+            let counter = 1;
+            let uniqueSlug = `${newSlug}-${counter}`;
+
+            while (
+              await courseCollection.findOne({
+                slug: uniqueSlug,
+                _id: { $ne: course._id },
+              })
+            ) {
+              counter++;
+              uniqueSlug = `${newSlug}-${counter}`;
+            }
+
+            updateData.slug = uniqueSlug;
+            console.log(`Generated unique slug: ${uniqueSlug}`);
+          } else {
+            updateData.slug = newSlug;
+            console.log(`Using new slug: ${newSlug}`);
+          }
         }
 
         const result = await courseCollection.updateOne(
-          { _id: new ObjectId(id) },
+          { _id: course._id },
           { $set: updateData },
         );
 
-        if (result.matchedCount === 0) {
-          return res.status(404).json({
-            success: false,
-            message: "Course not found",
-          });
-        }
+        console.log("Update result:", result);
 
         res.status(200).json({
           success: true,
           message: "Course updated successfully",
+          slug: updateData.slug || course.slug, // Return the new slug if changed
         });
       } catch (error) {
         console.error("Update course error:", error);
@@ -2833,12 +2888,12 @@ async function run() {
     });
 
     // 2. bKash Callback URL (handles payment response)
-    // 2. bKash Callback URL (handles payment response)
+    // ============= UPDATE THE CALLBACK HANDLER =============
     app.get("/payments/bkash/callback", async (req, res) => {
       try {
         const { paymentID, status } = req.query;
 
-        console.log("bKash Callback received:", { paymentID, status });
+        console.log("📞 bKash Callback received:", { paymentID, status });
 
         if (status === "success" && paymentID) {
           // First, find the payment by paymentID to get merchantInvoiceNumber
@@ -2847,19 +2902,39 @@ async function run() {
           });
 
           if (!payment) {
-            console.error("Payment not found for paymentID:", paymentID);
+            console.error("❌ Payment not found for paymentID:", paymentID);
             return res.redirect(
               `${process.env.BKASH_FRONTEND_URL}/payment/failed?error=payment_not_found`,
             );
           }
 
+          console.log("✅ Found payment record:", {
+            merchantInvoiceNumber: payment.merchantInvoiceNumber,
+            amount: payment.amount,
+          });
+
           // Execute payment
           const executeResponse = await executeBkashPayment(paymentID);
 
-          if (executeResponse.success) {
+          if (executeResponse.success && executeResponse.data) {
+            // Make sure we have the trxID
+            const bKashData = executeResponse.data;
+
+            if (!bKashData.trxID) {
+              console.error("❌ No trxID in bKash response:", bKashData);
+              return res.redirect(
+                `${process.env.BKASH_FRONTEND_URL}/payment/failed?error=no_transaction_id`,
+              );
+            }
+
+            console.log(
+              "✅ Payment executed successfully with trxID:",
+              bKashData.trxID,
+            );
+
             // Update payment status and enroll user
             await handleSuccessfulPayment(
-              executeResponse.data,
+              bKashData,
               payment.merchantInvoiceNumber,
             );
 
@@ -2868,13 +2943,18 @@ async function run() {
               `${process.env.BKASH_FRONTEND_URL}/payment/success?invoice=${payment.merchantInvoiceNumber}`,
             );
           } else {
+            console.error(
+              "❌ Payment execution failed:",
+              executeResponse.error,
+            );
             return res.redirect(
               `${process.env.BKASH_FRONTEND_URL}/payment/failed?invoice=${payment.merchantInvoiceNumber}`,
             );
           }
         } else {
           // Payment failed or cancelled
-          // Try to find payment by paymentID if available
+          console.log("❌ Payment failed or cancelled:", { paymentID, status });
+
           if (paymentID) {
             const payment = await paymentCollection.findOne({
               bkashPaymentID: paymentID,
@@ -2900,15 +2980,16 @@ async function run() {
           );
         }
       } catch (error) {
-        console.error("bKash callback error:", error);
+        console.error("❌ bKash callback error:", error);
         res.redirect(`${process.env.BKASH_FRONTEND_URL}/payment/error`);
       }
     });
 
     // Helper function to execute bKash payment
-    // Helper function to execute bKash payment
     async function executeBkashPayment(paymentID) {
       try {
+        console.log("🔄 Executing bKash payment for paymentID:", paymentID);
+
         // Get new token for execution
         const tokenResponse = await axios.post(
           `${BKASH_CONFIG.base_url}/tokenized/checkout/token/grant`,
@@ -2926,6 +3007,7 @@ async function run() {
         );
 
         const id_token = tokenResponse.data.id_token;
+        console.log("✅ Got execution token");
 
         // Execute payment
         const executeResponse = await axios.post(
@@ -2940,100 +3022,24 @@ async function run() {
           },
         );
 
-        console.log("bKash execute response:", executeResponse.data);
+        console.log("✅ bKash execute response received:", {
+          trxID: executeResponse.data.trxID,
+          amount: executeResponse.data.amount,
+          paymentID: executeResponse.data.paymentID,
+        });
+
         return { success: true, data: executeResponse.data };
       } catch (error) {
         console.error(
-          "Execute bKash payment error:",
+          "❌ Execute bKash payment error:",
           error.response?.data || error.message,
         );
         return { success: false, error: error.message };
       }
     }
 
-    // Helper function to handle successful payment
-    // Helper function to handle successful payment
-    async function handleSuccessfulPayment(paymentData, merchantInvoiceNumber) {
-      try {
-        console.log("Handling successful payment:", {
-          paymentData,
-          merchantInvoiceNumber,
-        });
-
-        // Update payment record
-        await paymentCollection.updateOne(
-          { merchantInvoiceNumber },
-          {
-            $set: {
-              status: "COMPLETED",
-              trxID: paymentData.trxID,
-              paymentData: paymentData,
-              updatedAt: new Date(),
-            },
-          },
-        );
-
-        // Find payment to get userId and courseId
-        const payment = await paymentCollection.findOne({
-          merchantInvoiceNumber,
-        });
-
-        if (payment) {
-          // Get course details
-          const course = await courseCollection.findOne({
-            _id: payment.courseId,
-          });
-
-          // Calculate end date based on course duration
-          const daysToAdd = parseDurationToDays(course.duration);
-          const endDate = new Date(
-            Date.now() + daysToAdd * 24 * 60 * 60 * 1000,
-          );
-
-          // Enroll user in course
-          const enrollmentData = {
-            courseId: payment.courseId,
-            enrollmentDate: new Date(),
-            startDate: new Date(),
-            endDate: endDate,
-            status: "active",
-            progress: {
-              overall: 0,
-              completedChapters: [],
-              completedLessons: [],
-              completedTopics: [],
-              lastAccessed: new Date(),
-              timeSpent: 0,
-            },
-            certificate: {
-              issued: false,
-              issueDate: null,
-              certificateUrl: null,
-              certificateId: null,
-            },
-          };
-
-          await userCollection.updateOne(
-            { _id: payment.userId },
-            { $push: { enrolledCourses: enrollmentData } },
-          );
-
-          console.log("User enrolled successfully:", payment.userId);
-
-          // Send notification
-          await notificationService.sendToUser(payment.userId, {
-            type: "course",
-            message: `Payment successful! You're now enrolled in '${course.title}'`,
-            details: `Transaction ID: ${paymentData.trxID}`,
-            actionUrl: `/course/${course.slug || payment.courseId}`,
-          });
-        }
-      } catch (error) {
-        console.error("Handle successful payment error:", error);
-      }
-    }
-
     // 3. Query payment status
+    // 3. Query payment status (UPDATED with more data)
     app.get(
       "/payments/status/:merchantInvoiceNumber",
       authenticateToken,
@@ -3053,13 +3059,26 @@ async function run() {
               .json({ success: false, message: "Payment not found" });
           }
 
+          // Get course details
+          const course = await courseCollection.findOne(
+            { _id: payment.courseId },
+            { projection: { title: 1, duration: 1, thumbnail: 1 } },
+          );
+
+          // Get user details
+          const user = await userCollection.findOne(
+            { _id: userId },
+            { projection: { name: 1, email: 1 } },
+          );
+
           res.json({
             success: true,
             payment: {
-              status: payment.status,
-              amount: payment.amount,
-              trxID: payment.trxID,
-              createdAt: payment.createdAt,
+              ...payment,
+              courseTitle: course?.title,
+              courseDuration: course?.duration,
+              studentName: user?.name,
+              studentEmail: user?.email,
             },
           });
         } catch (error) {
@@ -3122,6 +3141,1191 @@ async function run() {
       }
     });
 
+    // ============= EMAIL TEMPLATES =============
+    const emailTemplates = {
+      // Payment Confirmation Email
+      paymentConfirmation: (data) => ({
+        subject: `🎉 Payment Confirmed - Enrollment Successful for ${data.courseTitle}`,
+        html: `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Payment Confirmation</title>
+        <style>
+          body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333333;
+            margin: 0;
+            padding: 0;
+            background-color: #f5f5f5;
+          }
+          .container {
+            max-width: 600px;
+            margin: 20px auto;
+            background: white;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+          }
+          .header {
+            background: linear-gradient(135deg, #0D9488 0%, #0F766E 100%);
+            padding: 40px 30px;
+            text-align: center;
+          }
+          .header h1 {
+            margin: 0;
+            color: white;
+            font-size: 28px;
+            font-weight: 600;
+          }
+          .header p {
+            margin: 10px 0 0;
+            color: rgba(255,255,255,0.9);
+            font-size: 16px;
+          }
+          .content {
+            padding: 40px 30px;
+          }
+          .success-badge {
+            background: #10B981;
+            color: white;
+            padding: 8px 20px;
+            border-radius: 50px;
+            display: inline-block;
+            font-weight: 600;
+            margin-bottom: 30px;
+          }
+          .details-card {
+            background: #F3F4F6;
+            border-radius: 12px;
+            padding: 25px;
+            margin: 25px 0;
+          }
+          .details-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 12px 0;
+            border-bottom: 1px solid #E5E7EB;
+          }
+          .details-row:last-child {
+            border-bottom: none;
+          }
+          .details-label {
+            font-weight: 600;
+            color: #4B5563;
+          }
+          .details-value {
+            font-weight: 500;
+            color: #0D9488;
+          }
+          .amount {
+            font-size: 24px;
+            font-weight: 700;
+            color: #0D9488;
+          }
+          .button {
+            display: inline-block;
+            background: #0D9488;
+            color: white;
+            text-decoration: none;
+            padding: 14px 30px;
+            border-radius: 8px;
+            font-weight: 600;
+            margin: 20px 0;
+            text-align: center;
+          }
+          .button:hover {
+            background: #0F766E;
+          }
+          .footer {
+            background: #F9FAFB;
+            padding: 30px;
+            text-align: center;
+            border-top: 1px solid #E5E7EB;
+          }
+          .footer p {
+            margin: 5px 0;
+            color: #6B7280;
+            font-size: 14px;
+          }
+          .social-links {
+            margin: 20px 0;
+          }
+          .social-links a {
+            display: inline-block;
+            margin: 0 10px;
+            color: #6B7280;
+            text-decoration: none;
+          }
+          .invoice-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+          }
+          .invoice-table th {
+            background: #E5E7EB;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+          }
+          .invoice-table td {
+            padding: 12px;
+            border-bottom: 1px solid #E5E7EB;
+          }
+          .invoice-table tr:last-child td {
+            border-bottom: none;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1>🎉 Payment Confirmed!</h1>
+            <p>Your enrollment was successful</p>
+          </div>
+          
+          <div class="content">
+            <div style="text-align: center;">
+              <span class="success-badge">✓ Payment Successful</span>
+            </div>
+            
+            <p style="font-size: 18px; text-align: center;">Hello <strong>${data.studentName}</strong>,</p>
+            <p style="text-align: center;">Thank you for your payment! You are now successfully enrolled in:</p>
+            
+            <h2 style="text-align: center; color: #0D9488; margin: 20px 0;">${data.courseTitle}</h2>
+            
+            <div class="details-card">
+              <h3 style="margin-top: 0; color: #1F2937;">📋 Payment Receipt</h3>
+              
+              <div class="details-row">
+                <span class="details-label">Transaction ID:</span>
+                <span class="details-value">${data.trxID}</span>
+              </div>
+              
+              <div class="details-row">
+                <span class="details-label">Invoice Number:</span>
+                <span class="details-value">${data.merchantInvoiceNumber}</span>
+              </div>
+              
+              <div class="details-row">
+                <span class="details-label">Payment Date:</span>
+                <span class="details-value">${new Date(data.paymentDate).toLocaleString("en-BD", { timeZone: "Asia/Dhaka" })}</span>
+              </div>
+              
+              <div class="details-row">
+                <span class="details-label">Payment Method:</span>
+                <span class="details-value">bKash</span>
+              </div>
+              
+              <div class="details-row">
+                <span class="details-label">Amount Paid:</span>
+                <span class="details-value amount">৳${data.amount.toLocaleString()}</span>
+              </div>
+            </div>
+            
+            <table class="invoice-table">
+              <tr>
+                <th>Description</th>
+                <th>Duration</th>
+                <th>Amount</th>
+              </tr>
+              <tr>
+                <td>${data.courseTitle}</td>
+                <td>${data.courseDuration}</td>
+                <td>৳${data.amount.toLocaleString()}</td>
+              </tr>
+              <tr>
+                <td colspan="2" style="text-align: right; font-weight: 600;">Total:</td>
+                <td style="font-weight: 700; color: #0D9488;">৳${data.amount.toLocaleString()}</td>
+              </tr>
+            </table>
+            
+            <div style="background: #EFF6FF; border-radius: 8px; padding: 20px; margin: 25px 0;">
+              <h4 style="margin-top: 0; color: #1E40AF;">📚 Course Access Details:</h4>
+              <ul style="list-style-type: none; padding: 0;">
+                <li style="margin: 10px 0;">✓ <strong>Access Duration:</strong> ${data.courseDuration}</li>
+                <li style="margin: 10px 0;">✓ <strong>Course Level:</strong> ${data.courseLevel}</li>
+                <li style="margin: 10px 0;">✓ <strong>Total Chapters:</strong> ${data.totalChapters}</li>
+                <li style="margin: 10px 0;">✓ <strong>Total Lessons:</strong> ${data.totalLessons}</li>
+                <li style="margin: 10px 0;">✓ <strong>Certificate:</strong> Available upon completion</li>
+              </ul>
+            </div>
+            
+            <div style="text-align: center;">
+              <a href="${data.courseUrl}" class="button">🎯 Start Learning Now</a>
+            </div>
+            
+            <div style="margin: 30px 0; padding: 20px; background: #F3F4F6; border-radius: 8px;">
+              <h4 style="margin-top: 0;">📱 Need Help?</h4>
+              <p>If you have any questions about your purchase or need technical support:</p>
+              <p>📧 Email: support@lmsacademy.com<br>
+              📞 Phone: +880 1234-567890<br>
+              💬 Live Chat: Available 24/7 on our website</p>
+            </div>
+          </div>
+          
+          <div class="footer">
+            <div class="social-links">
+              <a href="#">Facebook</a> • 
+              <a href="#">Twitter</a> • 
+              <a href="#">LinkedIn</a> • 
+              <a href="#">Instagram</a>
+            </div>
+            <p>© ${new Date().getFullYear()} LMS Academy. All rights reserved.</p>
+            <p>123 Gulshan Avenue, Dhaka 1212, Bangladesh</p>
+            <p style="font-size: 12px;">This is a system generated email. Please do not reply to this email.</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `,
+      }),
+
+      // Invoice PDF Template (for attachment - optional)
+      invoiceTemplate: (data) => `
+    LMS ACADEMY - OFFICIAL RECEIPT
+    ==============================
+    
+    Receipt No: ${data.merchantInvoiceNumber}
+    Date: ${new Date(data.paymentDate).toLocaleDateString("en-BD")}
+    
+    STUDENT DETAILS
+    ---------------
+    Name: ${data.studentName}
+    Email: ${data.studentEmail}
+    Student ID: ${data.studentId}
+    
+    PAYMENT DETAILS
+    ---------------
+    Transaction ID: ${data.trxID}
+    Payment Method: bKash
+    Amount: ৳${data.amount}
+    
+    COURSE DETAILS
+    --------------
+    Course: ${data.courseTitle}
+    Duration: ${data.courseDuration}
+    Level: ${data.courseLevel}
+    Instructor: ${data.instructorName || "Course Team"}
+    
+    PAYMENT SUMMARY
+    ---------------
+    Subtotal: ৳${data.amount}
+    VAT (0%): ৳0
+    Total: ৳${data.amount}
+    
+    Status: PAID ✓
+    
+    ==============================
+    This is a computer generated receipt.
+    For any queries, contact support@lmsacademy.com
+    ==============================
+  `,
+    };
+
+    // ============= PAYMENT EMAIL SERVICE =============
+    const paymentEmailService = {
+      // Send payment confirmation email
+      sendPaymentConfirmation: async (paymentData, userData, courseData) => {
+        try {
+          console.log(
+            "📧 Preparing payment confirmation email for:",
+            userData.email,
+          );
+
+          // Prepare email data
+          const emailData = {
+            studentName: userData.name,
+            studentEmail: userData.email,
+            studentId: userData.uniqueId,
+            courseTitle: courseData.title,
+            courseDuration: courseData.duration,
+            courseLevel: courseData.level,
+            courseUrl: `${process.env.BKASH_FRONTEND_URL}/course/${courseData.slug || courseData._id}`,
+            totalChapters: courseData.totalChapters || 0,
+            totalLessons: courseData.totalLessons || 0,
+            amount: paymentData.amount,
+            trxID: paymentData.trxID,
+            merchantInvoiceNumber: paymentData.merchantInvoiceNumber,
+            paymentDate: paymentData.updatedAt || new Date(),
+            instructorName: courseData.instructorName || "Dr. Smith",
+          };
+
+          // Get email template
+          const template = emailTemplates.paymentConfirmation(emailData);
+
+          // Create PDF invoice (optional - you'd need a PDF library like pdfkit)
+          // const pdfBuffer = await generatePDFInvoice(emailData);
+
+          // Send email
+          const mailOptions = {
+            from: {
+              name: "LMS Academy",
+              address: process.env.EMAIL_USER,
+            },
+            to: userData.email,
+            subject: template.subject,
+            html: template.html,
+            // attachments: [
+            //   {
+            //     filename: `invoice-${paymentData.merchantInvoiceNumber}.pdf`,
+            //     content: pdfBuffer,
+            //     contentType: 'application/pdf'
+            //   }
+            // ]
+          };
+
+          const info = await transporter.sendMail(mailOptions);
+          console.log("✅ Payment confirmation email sent:", info.messageId);
+
+          // Log email in database
+          await db.collection("emailLogs").insertOne({
+            type: "payment_confirmation",
+            userId: userData._id,
+            email: userData.email,
+            merchantInvoiceNumber: paymentData.merchantInvoiceNumber,
+            messageId: info.messageId,
+            sentAt: new Date(),
+            status: "sent",
+          });
+
+          return { success: true, messageId: info.messageId };
+        } catch (error) {
+          console.error("❌ Failed to send payment confirmation email:", error);
+
+          // Log failed email
+          await db.collection("emailLogs").insertOne({
+            type: "payment_confirmation",
+            userId: userData?._id,
+            email: userData?.email,
+            merchantInvoiceNumber: paymentData?.merchantInvoiceNumber,
+            error: error.message,
+            attemptedAt: new Date(),
+            status: "failed",
+          });
+
+          return { success: false, error: error.message };
+        }
+      },
+
+      // Send payment receipt to admin (optional)
+      sendAdminNotification: async (paymentData, userData, courseData) => {
+        try {
+          const adminEmail = process.env.ADMIN_EMAIL || "admin@lmsacademy.com";
+
+          const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: adminEmail,
+            subject: `💰 New Payment Received: ৳${paymentData.amount} - ${courseData.title}`,
+            html: `
+          <h2>New Payment Received</h2>
+          <p><strong>Student:</strong> ${userData.name} (${userData.email})</p>
+          <p><strong>Course:</strong> ${courseData.title}</p>
+          <p><strong>Amount:</strong> ৳${paymentData.amount}</p>
+          <p><strong>Transaction ID:</strong> ${paymentData.trxID}</p>
+          <p><strong>Invoice:</strong> ${paymentData.merchantInvoiceNumber}</p>
+          <p><strong>Date:</strong> ${new Date().toLocaleString()}</p>
+        `,
+          };
+
+          await transporter.sendMail(mailOptions);
+          console.log("✅ Admin notification sent");
+        } catch (error) {
+          console.error("❌ Failed to send admin notification:", error);
+        }
+      },
+    };
+
+    // ============= UPDATE THE HANDLE SUCCESSFUL PAYMENT FUNCTION =============
+    // Replace your existing handleSuccessfulPayment function with this:
+    // ============= UPDATE THE HANDLE SUCCESSFUL PAYMENT FUNCTION =============
+    async function handleSuccessfulPayment(bKashData, merchantInvoiceNumber) {
+      try {
+        console.log("💰 Handling successful payment:", {
+          trxID: bKashData.trxID,
+          merchantInvoiceNumber,
+        });
+
+        // Update payment record with bKash data
+        const updateResult = await paymentCollection.updateOne(
+          { merchantInvoiceNumber },
+          {
+            $set: {
+              status: "COMPLETED",
+              trxID: bKashData.trxID,
+              paymentID: bKashData.paymentID,
+              amount: parseFloat(bKashData.amount) || undefined,
+              paymentData: {
+                ...bKashData,
+                receivedAt: new Date(),
+              },
+              updatedAt: new Date(),
+            },
+          },
+        );
+
+        console.log("✅ Payment record updated:", updateResult);
+
+        // Find the updated payment to get userId and courseId
+        const payment = await paymentCollection.findOne({
+          merchantInvoiceNumber,
+        });
+
+        if (!payment) {
+          console.error(
+            "❌ Payment not found after update:",
+            merchantInvoiceNumber,
+          );
+          return;
+        }
+
+        console.log("✅ Found payment record:", {
+          userId: payment.userId,
+          courseId: payment.courseId,
+          amount: payment.amount,
+        });
+
+        // Get course details
+        const course = await courseCollection.findOne({
+          _id: payment.courseId,
+        });
+        if (!course) {
+          console.error("❌ Course not found:", payment.courseId);
+          return;
+        }
+
+        // Get user details
+        const user = await userCollection.findOne({ _id: payment.userId });
+        if (!user) {
+          console.error("❌ User not found:", payment.userId);
+          return;
+        }
+
+        console.log("✅ Found course and user:", {
+          course: course.title,
+          user: user.email,
+        });
+
+        // Calculate end date based on course duration
+        const daysToAdd = parseDurationToDays(course.duration);
+        const endDate = new Date(Date.now() + daysToAdd * 24 * 60 * 60 * 1000);
+
+        // Enroll user in course
+        const enrollmentData = {
+          courseId: payment.courseId,
+          enrollmentDate: new Date(),
+          startDate: new Date(),
+          endDate: endDate,
+          status: "active",
+          progress: {
+            overall: 0,
+            completedChapters: [],
+            completedLessons: [],
+            completedTopics: [],
+            lastAccessed: new Date(),
+            timeSpent: 0,
+          },
+          certificate: {
+            issued: false,
+            issueDate: null,
+            certificateUrl: null,
+            certificateId: null,
+          },
+        };
+
+        const enrollResult = await userCollection.updateOne(
+          { _id: payment.userId },
+          { $push: { enrolledCourses: enrollmentData } },
+        );
+
+        console.log("✅ User enrolled successfully:", enrollResult);
+
+        // Send in-app notification
+        await notificationService.sendToUser(payment.userId, {
+          type: "course",
+          message: `Payment successful! You're now enrolled in '${course.title}'`,
+          details: `Transaction ID: ${bKashData.trxID}`,
+          actionUrl: `/course/${course.slug || payment.courseId}`,
+        });
+
+        // Send payment confirmation email
+        try {
+          await paymentEmailService.sendPaymentConfirmation(
+            {
+              ...payment,
+              trxID: bKashData.trxID,
+              amount: parseFloat(bKashData.amount) || payment.amount,
+            },
+            user,
+            course,
+          );
+          console.log("✅ Payment confirmation email sent");
+        } catch (emailError) {
+          console.error("❌ Failed to send email:", emailError);
+        }
+
+        // Optional: Send admin notification
+        try {
+          await paymentEmailService.sendAdminNotification(
+            { ...payment, trxID: bKashData.trxID },
+            user,
+            course,
+          );
+        } catch (adminError) {
+          console.error("❌ Failed to send admin notification:", adminError);
+        }
+      } catch (error) {
+        console.error("❌ Handle successful payment error:", error);
+      }
+    }
+
+    // ============= ADD PAYMENT RECEIPT DOWNLOAD ROUTE =============
+
+    // Download payment receipt
+    // Download payment receipt (UPDATED)
+    //     app.get(
+    //       "/payments/receipt/:merchantInvoiceNumber",
+    //       authenticateToken,
+    //       async (req, res) => {
+    //         try {
+    //           const { merchantInvoiceNumber } = req.params;
+    //           const userId = req.user.userId;
+
+    //           const payment = await paymentCollection.findOne({
+    //             merchantInvoiceNumber,
+    //             userId: new ObjectId(userId),
+    //           });
+
+    //           if (!payment) {
+    //             return res
+    //               .status(404)
+    //               .json({ success: false, message: "Payment not found" });
+    //           }
+
+    //           const course = await courseCollection.findOne({
+    //             _id: payment.courseId,
+    //           });
+    //           const user = await userCollection.findOne({ _id: userId });
+
+    //           // Generate receipt with actual transaction ID
+    //           const receipt = `
+    // ===========================================
+    //           LMS ACADEMY
+    //       OFFICIAL PAYMENT RECEIPT
+    // ===========================================
+
+    // Receipt No: ${payment.merchantInvoiceNumber}
+    // Date: ${new Date(payment.updatedAt || payment.createdAt).toLocaleDateString("en-BD", { timeZone: "Asia/Dhaka" })}
+    // Time: ${new Date(payment.updatedAt || payment.createdAt).toLocaleTimeString("en-BD", { timeZone: "Asia/Dhaka" })}
+
+    // -------------------------------------------
+    // STUDENT INFORMATION
+    // -------------------------------------------
+    // Name: ${user?.name || "N/A"}
+    // Email: ${user?.email || "N/A"}
+    // Student ID: ${user?.uniqueId || "N/A"}
+
+    // -------------------------------------------
+    // PAYMENT DETAILS
+    // -------------------------------------------
+    // Transaction ID: ${payment.trxID || payment.paymentData?.trxID || "N/A"}
+    // Payment Method: bKash
+    // Amount: ৳${payment.amount?.toLocaleString() || "0"}
+    // Status: PAID ✓
+
+    // -------------------------------------------
+    // COURSE INFORMATION
+    // -------------------------------------------
+    // Course: ${course?.title || "N/A"}
+    // Duration: ${course?.duration || "N/A"}
+    // Level: ${course?.level || "N/A"}
+
+    // -------------------------------------------
+    // SUMMARY
+    // -------------------------------------------
+    // Subtotal: ৳${payment.amount?.toLocaleString() || "0"}
+    // VAT (0%): ৳0
+    // Total Paid: ৳${payment.amount?.toLocaleString() || "0"}
+
+    // ===========================================
+    // This is a computer generated receipt.
+    // For any queries, contact: support@lmsacademy.com
+    // ===========================================
+    //     `;
+
+    //           res.setHeader("Content-Type", "text/plain");
+    //           res.setHeader(
+    //             "Content-Disposition",
+    //             `attachment; filename=receipt-${merchantInvoiceNumber}.txt`,
+    //           );
+    //           res.send(receipt);
+    //         } catch (error) {
+    //           console.error("Download receipt error:", error);
+    //           res
+    //             .status(500)
+    //             .json({ success: false, message: "Failed to download receipt" });
+    //         }
+    //       },
+    //     );
+
+    // ============= ADD EMAIL LOGS ROUTE (Admin only) =============
+    app.get("/admin/email-logs", authenticateToken, async (req, res) => {
+      try {
+        // Check if user is admin
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+        if (user.role !== "admin") {
+          return res
+            .status(403)
+            .json({ success: false, message: "Admin access required" });
+        }
+
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const skip = (page - 1) * limit;
+
+        const logs = await emailLogCollection
+          .find({})
+          .sort({ sentAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+
+        const total = await emailLogCollection.countDocuments();
+
+        res.json({
+          success: true,
+          logs,
+          pagination: {
+            page,
+            limit,
+            total,
+            pages: Math.ceil(total / limit),
+          },
+        });
+      } catch (error) {
+        console.error("Get email logs error:", error);
+        res
+          .status(500)
+          .json({ success: false, message: "Failed to get email logs" });
+      }
+    });
+
+    // ============= PDF GENERATION WITH PDFKIT =============
+
+    // Helper function to format date
+    const formatDate = (date) => {
+      return new Date(date).toLocaleDateString("en-BD", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    };
+
+    // Generate PDF Receipt
+    const generatePDFReceipt = async (payment, user, course) => {
+      return new Promise((resolve, reject) => {
+        try {
+          // Create a PDF document
+          const doc = new PDFDocument({
+            size: "A4",
+            margin: 50,
+            info: {
+              Title: `Payment Receipt - ${payment.merchantInvoiceNumber}`,
+              Author: "LMS Academy",
+              Subject: "Course Payment Receipt",
+              Keywords: "receipt, payment, lms",
+              Creator: "LMS Academy",
+            },
+          });
+
+          // Collect PDF chunks
+          const chunks = [];
+          doc.on("data", (chunk) => chunks.push(chunk));
+          doc.on("end", () => resolve(Buffer.concat(chunks)));
+
+          // ===== HEADER SECTION =====
+          // Company Logo/Name
+          doc
+            .fontSize(24)
+            .font("Helvetica-Bold")
+            .fillColor("#0D9488")
+            .text("LMS ACADEMY", { align: "center" });
+
+          doc.moveDown(0.5);
+          doc
+            .fontSize(14)
+            .font("Helvetica")
+            .fillColor("#4B5563")
+            .text("Official Payment Receipt", { align: "center" });
+
+          doc.moveDown(0.5);
+          doc
+            .fontSize(10)
+            .fillColor("#6B7280")
+            .text("123 Gulshan Avenue, Dhaka 1212, Bangladesh", {
+              align: "center",
+            });
+
+          // Decorative line
+          doc.moveDown(1);
+          doc
+            .strokeColor("#0D9488")
+            .lineWidth(2)
+            .moveTo(50, doc.y)
+            .lineTo(550, doc.y)
+            .stroke();
+
+          doc.moveDown(1);
+
+          // ===== RECEIPT INFO =====
+          doc.fontSize(10).font("Helvetica").fillColor("#374151");
+
+          // Receipt Number and Date in two columns
+          const startY = doc.y;
+
+          // Left column - Receipt Info
+          doc
+            .text("Receipt Number:", 50, startY, { continued: true })
+            .font("Helvetica-Bold")
+            .text(` ${payment.merchantInvoiceNumber}`, { continued: false });
+
+          doc.moveDown(0.5);
+          doc
+            .font("Helvetica")
+            .text("Date:", 50, doc.y, { continued: true })
+            .font("Helvetica-Bold")
+            .text(` ${formatDate(payment.updatedAt || payment.createdAt)}`);
+
+          // Right column - Status
+          doc
+            .font("Helvetica")
+            .text("Status:", 350, startY, { continued: true })
+            .font("Helvetica-Bold")
+            .fillColor("#10B981")
+            .text(" PAID ✓");
+
+          doc.moveDown(2);
+
+          // ===== STUDENT INFORMATION SECTION =====
+          doc
+            .fontSize(14)
+            .font("Helvetica-Bold")
+            .fillColor("#0D9488")
+            .text("Student Information");
+
+          doc.moveDown(0.5);
+
+          // Student details in a box
+          doc.rect(50, doc.y - 5, 500, 70).fillAndStroke("#F3F4F6", "#E5E7EB");
+
+          const studentInfoY = doc.y;
+          doc.fontSize(11).font("Helvetica").fillColor("#1F2937");
+
+          // Student Name
+          doc
+            .text("Full Name:", 70, studentInfoY + 10, { continued: true })
+            .font("Helvetica-Bold")
+            .text(` ${user?.name || "N/A"}`);
+
+          doc.moveDown(0.8);
+          // Email
+          doc
+            .font("Helvetica")
+            .text("Email:", 70, doc.y, { continued: true })
+            .font("Helvetica-Bold")
+            .text(` ${user?.email || "N/A"}`);
+
+          doc.moveDown(0.8);
+          // Student ID
+          doc
+            .font("Helvetica")
+            .text("Student ID:", 70, doc.y, { continued: true })
+            .font("Helvetica-Bold")
+            .text(` ${user?.uniqueId || "N/A"}`);
+
+          doc.moveDown(2);
+
+          // ===== PAYMENT DETAILS SECTION =====
+          doc
+            .fontSize(14)
+            .font("Helvetica-Bold")
+            .fillColor("#0D9488")
+            .text("Payment Details");
+
+          doc.moveDown(0.5);
+
+          // Create a table for payment details
+          const tableTop = doc.y;
+          const col1 = 70;
+          const col2 = 250;
+          const col3 = 400;
+
+          // Table Header
+          doc
+            .fontSize(10)
+            .font("Helvetica-Bold")
+            .fillColor("#374151")
+            .text("Description", col1, tableTop)
+            .text("Reference", col2, tableTop)
+            .text("Amount", col3, tableTop);
+
+          doc.moveDown(0.5);
+          doc
+            .strokeColor("#D1D5DB")
+            .lineWidth(1)
+            .moveTo(50, doc.y)
+            .lineTo(550, doc.y)
+            .stroke();
+
+          doc.moveDown(0.5);
+
+          // Table Row
+          const rowY = doc.y;
+          doc
+            .font("Helvetica")
+            .fillColor("#1F2937")
+            .text("Course Enrollment", col1, rowY)
+            .text(
+              `TXN: ${payment.trxID || payment.paymentData?.trxID || "N/A"}`,
+              col2,
+              rowY,
+            )
+            .font("Helvetica-Bold")
+            .fillColor("#0D9488")
+            .text(`৳${(payment.amount || 0).toLocaleString()}`, col3, rowY);
+
+          doc.moveDown(1.5);
+
+          // ===== COURSE INFORMATION SECTION =====
+          doc
+            .fontSize(14)
+            .font("Helvetica-Bold")
+            .fillColor("#0D9488")
+            .text("Course Information");
+
+          doc.moveDown(0.5);
+
+          // Course details in a grid
+          const courseStartY = doc.y;
+          doc.fontSize(11).font("Helvetica").fillColor("#1F2937");
+
+          // Left column
+          doc
+            .text("Course:", 70, courseStartY, { continued: true })
+            .font("Helvetica-Bold")
+            .text(` ${course?.title || "N/A"}`, { continued: false });
+
+          doc.moveDown(0.8);
+          doc
+            .font("Helvetica")
+            .text("Duration:", 70, doc.y, { continued: true })
+            .font("Helvetica-Bold")
+            .text(` ${course?.duration || "N/A"}`);
+
+          doc.moveDown(0.8);
+          doc
+            .font("Helvetica")
+            .text("Level:", 70, doc.y, { continued: true })
+            .font("Helvetica-Bold")
+            .text(` ${course?.level || "N/A"}`);
+
+          // Right column
+          const rightColY = courseStartY;
+          doc
+            .font("Helvetica")
+            .text("Access:", 350, rightColY, { continued: true })
+            .font("Helvetica-Bold")
+            .text(" Lifetime Access");
+
+          doc.moveDown(0.8);
+          doc
+            .font("Helvetica")
+            .text("Certificate:", 350, doc.y, { continued: true })
+            .font("Helvetica-Bold")
+            .fillColor("#0D9488")
+            .text(" Available upon completion");
+
+          doc.moveDown(2);
+
+          // ===== SUMMARY SECTION =====
+          doc
+            .fontSize(14)
+            .font("Helvetica-Bold")
+            .fillColor("#0D9488")
+            .text("Payment Summary");
+
+          doc.moveDown(0.5);
+
+          // Summary box
+          doc.rect(350, doc.y - 5, 200, 80).fillAndStroke("#F3F4F6", "#E5E7EB");
+
+          const summaryY = doc.y;
+          doc.fontSize(11).font("Helvetica").fillColor("#1F2937");
+
+          doc
+            .text("Subtotal:", 370, summaryY + 10, { continued: true })
+            .font("Helvetica-Bold")
+            .text(` ৳${(payment.amount || 0).toLocaleString()}`);
+
+          doc.moveDown(0.8);
+          doc
+            .font("Helvetica")
+            .text("VAT (0%):", 370, doc.y, { continued: true })
+            .font("Helvetica-Bold")
+            .text(" ৳0");
+
+          doc.moveDown(0.8);
+          doc
+            .font("Helvetica-Bold")
+            .fillColor("#0D9488")
+            .fontSize(12)
+            .text("Total Paid:", 370, doc.y, { continued: true })
+            .text(` ৳${(payment.amount || 0).toLocaleString()}`);
+
+          doc.moveDown(3);
+
+          // ===== FOOTER =====
+          doc
+            .fontSize(9)
+            .font("Helvetica")
+            .fillColor("#6B7280")
+            .text(
+              "This is a computer generated receipt. No signature required.",
+              50,
+              700,
+              { align: "center" },
+            )
+            .text(
+              "For any queries, contact: support@lmsacademy.com | +880 1234-567890",
+              { align: "center" },
+            )
+            .text(
+              `© ${new Date().getFullYear()} LMS Academy. All rights reserved.`,
+              { align: "center" },
+            );
+
+          // Add watermark/stamp
+          doc.save();
+          doc
+            .fontSize(60)
+            .font("Helvetica-Bold")
+            .fillColor("#0D9488")
+            .fillOpacity(0.1)
+            .rotate(-45, { origin: [300, 400] })
+            .text("PAID", 200, 350);
+          doc.restore();
+
+          // Finalize the PDF
+          doc.end();
+        } catch (error) {
+          reject(error);
+        }
+      });
+    };
+
+    // ===== UPDATE THE DOWNLOAD RECEIPT ROUTE =====
+    // ===== UPDATED PDF RECEIPT DOWNLOAD ROUTE =====
+    app.get(
+      "/payments/receipt/:merchantInvoiceNumber",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { merchantInvoiceNumber } = req.params;
+          const userId = req.user.userId;
+
+          console.log("📄 Generating PDF receipt for:", {
+            merchantInvoiceNumber,
+            userId,
+          });
+
+          // Find payment
+          const payment = await paymentCollection.findOne({
+            merchantInvoiceNumber,
+            userId: new ObjectId(userId),
+          });
+
+          if (!payment) {
+            console.error("❌ Payment not found:", merchantInvoiceNumber);
+            return res
+              .status(404)
+              .json({ success: false, message: "Payment not found" });
+          }
+
+          console.log("✅ Payment found:", {
+            id: payment._id,
+            amount: payment.amount,
+            trxID: payment.trxID,
+          });
+
+          // Get course details
+          const course = await courseCollection.findOne({
+            _id: payment.courseId,
+          });
+          if (!course) {
+            console.error("❌ Course not found:", payment.courseId);
+          }
+
+          // Get user details
+          const user = await userCollection.findOne({ _id: userId });
+          if (!user) {
+            console.error("❌ User not found:", userId);
+          }
+
+          console.log("✅ User and course found:", {
+            userName: user?.name,
+            userEmail: user?.email,
+            courseTitle: course?.title,
+          });
+
+          try {
+            // Generate PDF
+            const pdfBuffer = await generatePDFReceipt(payment, user, course);
+
+            console.log(
+              "✅ PDF generated successfully, size:",
+              pdfBuffer.length,
+              "bytes",
+            );
+
+            // Send PDF
+            res.setHeader("Content-Type", "application/pdf");
+            res.setHeader(
+              "Content-Disposition",
+              `attachment; filename=receipt-${merchantInvoiceNumber}.pdf`,
+            );
+            res.setHeader("Content-Length", pdfBuffer.length);
+            res.setHeader("Cache-Control", "no-cache");
+
+            // Send the PDF buffer
+            res.send(pdfBuffer);
+          } catch (pdfError) {
+            console.error("❌ PDF generation error:", pdfError);
+
+            // Fallback to text receipt if PDF fails
+            const fallbackReceipt = `
+===========================================
+          LMS ACADEMY
+      OFFICIAL PAYMENT RECEIPT
+===========================================
+
+Receipt No: ${payment.merchantInvoiceNumber}
+Date: ${new Date(payment.updatedAt || payment.createdAt).toLocaleDateString("en-BD")}
+
+-------------------------------------------
+STUDENT INFORMATION
+-------------------------------------------
+Name: ${user?.name || "N/A"}
+Email: ${user?.email || "N/A"}
+
+-------------------------------------------
+PAYMENT DETAILS
+-------------------------------------------
+Transaction ID: ${payment.trxID || payment.paymentData?.trxID || "N/A"}
+Amount: ৳${payment.amount?.toLocaleString() || "0"}
+
+-------------------------------------------
+COURSE INFORMATION
+-------------------------------------------
+Course: ${course?.title || "N/A"}
+
+===========================================
+      `;
+
+            res.setHeader("Content-Type", "text/plain");
+            res.setHeader(
+              "Content-Disposition",
+              `attachment; filename=receipt-${merchantInvoiceNumber}.txt`,
+            );
+            res.send(fallbackReceipt);
+          }
+        } catch (error) {
+          console.error("❌ Download receipt error:", error);
+          res
+            .status(500)
+            .json({ success: false, message: "Failed to download receipt" });
+        }
+      },
+    );
+
+    // ===== UPDATE THE PAYMENT STATUS ROUTE =====
+
+    app.get(
+      "/payments/status/:merchantInvoiceNumber",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { merchantInvoiceNumber } = req.params;
+          const userId = req.user.userId;
+
+          console.log("🔍 Checking payment status for:", merchantInvoiceNumber);
+
+          // Find payment
+          const payment = await paymentCollection.findOne({
+            merchantInvoiceNumber,
+            userId: new ObjectId(userId),
+          });
+
+          if (!payment) {
+            return res
+              .status(404)
+              .json({ success: false, message: "Payment not found" });
+          }
+
+          // Get user details
+          const user = await userCollection.findOne(
+            { _id: new ObjectId(userId) },
+            { projection: { name: 1, email: 1, uniqueId: 1 } },
+          );
+
+          // Get course details
+          const course = await courseCollection.findOne(
+            { _id: payment.courseId },
+            { projection: { title: 1, duration: 1, level: 1 } },
+          );
+
+          // Prepare response with proper student data
+          const responseData = {
+            success: true,
+            payment: {
+              _id: payment._id,
+              merchantInvoiceNumber: payment.merchantInvoiceNumber,
+              amount: payment.amount,
+              status: payment.status,
+              trxID: payment.trxID || payment.paymentData?.trxID || "N/A",
+              createdAt: payment.createdAt,
+              updatedAt: payment.updatedAt,
+              // Student information -直接从user对象获取
+              studentName: user?.name || "Student",
+              studentEmail: user?.email || "student@example.com",
+              studentId: user?.uniqueId || "N/A",
+              // Course information
+              courseTitle: course?.title || "Course",
+              courseDuration: course?.duration || "Self-paced",
+              courseLevel: course?.level || "All Levels",
+            },
+          };
+
+          console.log("✅ Sending payment status response with student:", {
+            name: responseData.payment.studentName,
+            email: responseData.payment.studentEmail,
+          });
+
+          res.json(responseData);
+        } catch (error) {
+          console.error("❌ Payment status error:", error);
+          res
+            .status(500)
+            .json({ success: false, message: "Failed to get payment status" });
+        }
+      },
+    );
     // Health check endpoint
     app.get("/health", (req, res) => {
       res.status(200).json({
