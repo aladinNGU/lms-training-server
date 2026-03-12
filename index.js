@@ -4,6 +4,8 @@ const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
+const axios = require("axios");
+const crypto = require("crypto");
 const { MongoClient, ObjectId, ServerApiVersion } = require("mongodb");
 require("dotenv").config();
 
@@ -13,6 +15,16 @@ const PORT = process.env.PORT || 7000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// bKash Configuration
+const BKASH_CONFIG = {
+  app_key: process.env.BKASH_APP_KEY,
+  app_secret: process.env.BKASH_APP_SECRET,
+  username: process.env.BKASH_USERNAME,
+  password: process.env.BKASH_PASSWORD,
+  base_url: process.env.BKASH_BASE_URL,
+  frontend_url: process.env.BKASH_FRONTEND_URL,
+};
 
 // Slug Generator Functions
 function generateSlug(title) {
@@ -85,6 +97,7 @@ async function run() {
     const userCollection = db.collection("users");
     const otpCollection = db.collection("otp");
     const certificateCollection = db.collection("certificates");
+    const paymentCollection = db.collection("payments");
 
     // Create indexes for better performance
     await courseCollection.createIndex({ slug: 1 }, { unique: true });
@@ -109,6 +122,19 @@ async function run() {
       { unique: true },
     );
     await userCollection.createIndex({ "notifications.createdAt": -1 });
+
+    await paymentCollection.createIndex(
+      { trxID: 1 },
+      { unique: true, sparse: true },
+    );
+    await paymentCollection.createIndex(
+      { merchantInvoiceNumber: 1 },
+      { unique: true },
+    );
+    await paymentCollection.createIndex({ status: 1 });
+    await paymentCollection.createIndex({ userId: 1 });
+    await paymentCollection.createIndex({ courseId: 1 });
+    console.log("Payment indexes created");
 
     console.log("Database indexes created");
 
@@ -137,6 +163,14 @@ async function run() {
 
     // ============= HELPER FUNCTIONS =============
 
+    // Helper function to generate unique invoice number
+    function generateInvoiceNumber() {
+      const timestamp = Date.now().toString();
+      const random = Math.floor(Math.random() * 10000)
+        .toString()
+        .padStart(4, "0");
+      return `INV-${timestamp}-${random}`;
+    }
     // Generate unique student ID
     async function generateUniqueStudentId() {
       const year = new Date().getFullYear();
@@ -681,8 +715,120 @@ async function run() {
     });
 
     // ============= COURSE ENROLLMENT ROUTES =============
+    function parseDurationToDays(duration) {
+      if (!duration) return 90; // Default 90 days
 
+      const durationStr = duration.toLowerCase();
+      const number = parseInt(durationStr);
+
+      if (durationStr.includes("month")) {
+        return number * 30; // Convert months to days
+      } else if (durationStr.includes("week")) {
+        return number * 7;
+      } else if (durationStr.includes("day")) {
+        return number;
+      } else if (durationStr.includes("year")) {
+        return number * 365;
+      }
+
+      return 90; // Default fallback
+    }
     // Enroll in a course (UPDATED WITH NOTIFICATION)
+    // app.post("/users/enroll/:courseId", authenticateToken, async (req, res) => {
+    //   try {
+    //     const { courseId } = req.params;
+    //     const userId = req.user.userId;
+
+    //     // Check if course exists
+    //     const course = await courseCollection.findOne({
+    //       _id: new ObjectId(courseId),
+    //     });
+
+    //     if (!course) {
+    //       return res
+    //         .status(404)
+    //         .json({ success: false, message: "Course not found" });
+    //     }
+
+    //     // Check if already enrolled
+    //     const user = await userCollection.findOne({
+    //       _id: new ObjectId(userId),
+    //       "enrolledCourses.courseId": new ObjectId(courseId),
+    //     });
+
+    //     if (user) {
+    //       return res.status(400).json({
+    //         success: false,
+    //         message: "Already enrolled in this course",
+    //       });
+    //     }
+
+    //     // Get course structure for progress tracking
+    //     const chapters = await chapterCollection
+    //       .find({ courseId: new ObjectId(courseId) })
+    //       .toArray();
+
+    //     const lessons = await lessonCollection
+    //       .find({ chapterId: { $in: chapters.map((c) => c._id) } })
+    //       .toArray();
+
+    //     const topics = await topicCollection
+    //       .find({ lessonId: { $in: lessons.map((l) => l._id) } })
+    //       .toArray();
+
+    //     const enrollmentData = {
+    //       courseId: new ObjectId(courseId),
+    //       enrollmentDate: new Date(),
+    //       startDate: new Date(),
+    //       endDate: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000), // 90 days from now
+    //       status: "active",
+    //       progress: {
+    //         overall: 0,
+    //         completedChapters: [],
+    //         completedLessons: [],
+    //         completedTopics: [],
+    //         lastAccessed: new Date(),
+    //         timeSpent: 0,
+    //       },
+    //       certificate: {
+    //         issued: false,
+    //         issueDate: null,
+    //         certificateUrl: null,
+    //         certificateId: null,
+    //       },
+    //     };
+
+    //     await userCollection.updateOne(
+    //       { _id: new ObjectId(userId) },
+    //       { $push: { enrolledCourses: enrollmentData } },
+    //     );
+
+    //     // ===== ADD NOTIFICATION =====
+    //     await notificationService.sendToUser(userId, {
+    //       type: "course",
+    //       message: `You have successfully enrolled in '${course.title}'`,
+    //       details: "Start your learning journey today!",
+    //       actionUrl: `/course/${course.slug || courseId}`,
+    //     });
+
+    //     res.json({
+    //       success: true,
+    //       message: "Successfully enrolled in course",
+    //       enrollment: enrollmentData,
+    //     });
+    //   } catch (error) {
+    //     console.error("Enrollment error:", error);
+    //     res.status(500).json({
+    //       success: false,
+    //       message: "Failed to enroll",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
+
+    // In your backend/index.js - Update the enrollment route
+
+    // Enroll in a course (UPDATED)
     app.post("/users/enroll/:courseId", authenticateToken, async (req, res) => {
       try {
         const { courseId } = req.params;
@@ -712,24 +858,15 @@ async function run() {
           });
         }
 
-        // Get course structure for progress tracking
-        const chapters = await chapterCollection
-          .find({ courseId: new ObjectId(courseId) })
-          .toArray();
-
-        const lessons = await lessonCollection
-          .find({ chapterId: { $in: chapters.map((c) => c._id) } })
-          .toArray();
-
-        const topics = await topicCollection
-          .find({ lessonId: { $in: lessons.map((l) => l._id) } })
-          .toArray();
+        // Calculate end date based on course duration
+        const daysToAdd = parseDurationToDays(course.duration);
+        const endDate = new Date(Date.now() + daysToAdd * 24 * 60 * 60 * 1000);
 
         const enrollmentData = {
           courseId: new ObjectId(courseId),
           enrollmentDate: new Date(),
           startDate: new Date(),
-          endDate: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000), // 90 days from now
+          endDate: endDate, // Use calculated date based on course duration
           status: "active",
           progress: {
             overall: 0,
@@ -752,7 +889,7 @@ async function run() {
           { $push: { enrolledCourses: enrollmentData } },
         );
 
-        // ===== ADD NOTIFICATION =====
+        // Send notification
         await notificationService.sendToUser(userId, {
           type: "course",
           message: `You have successfully enrolled in '${course.title}'`,
@@ -2571,6 +2708,417 @@ async function run() {
           message: "Failed to get enrolled count",
           error: error.message,
         });
+      }
+    });
+
+    // 1. Create bKash payment (initialize payment)
+    app.post("/payments/bkash/create", authenticateToken, async (req, res) => {
+      try {
+        const { courseId, amount } = req.body;
+        const userId = req.user.userId;
+
+        // Validate course exists
+        const course = await courseCollection.findOne({
+          _id: new ObjectId(courseId),
+        });
+        if (!course) {
+          return res
+            .status(404)
+            .json({ success: false, message: "Course not found" });
+        }
+
+        // Check if already enrolled
+        const user = await userCollection.findOne({
+          _id: new ObjectId(userId),
+          "enrolledCourses.courseId": new ObjectId(courseId),
+        });
+
+        if (user) {
+          return res.status(400).json({
+            success: false,
+            message: "Already enrolled in this course",
+          });
+        }
+
+        // Generate unique invoice number
+        const merchantInvoiceNumber = generateInvoiceNumber();
+
+        // Create payment record in database
+        const paymentData = {
+          userId: new ObjectId(userId),
+          courseId: new ObjectId(courseId),
+          amount: parseFloat(amount),
+          currency: "BDT",
+          merchantInvoiceNumber,
+          status: "INITIATED",
+          paymentMethod: "bkash",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        await paymentCollection.insertOne(paymentData);
+
+        // Get bKash token
+        const tokenResponse = await axios.post(
+          `${BKASH_CONFIG.base_url}/tokenized/checkout/token/grant`,
+          {
+            app_key: BKASH_CONFIG.app_key,
+            app_secret: BKASH_CONFIG.app_secret,
+          },
+          {
+            headers: {
+              "Content-Type": "application/json",
+              username: BKASH_CONFIG.username,
+              password: BKASH_CONFIG.password,
+            },
+          },
+        );
+
+        if (!tokenResponse.data || !tokenResponse.data.id_token) {
+          throw new Error("Failed to get bKash token");
+        }
+
+        const id_token = tokenResponse.data.id_token;
+
+        // Create bKash payment
+        const paymentResponse = await axios.post(
+          `${BKASH_CONFIG.base_url}/tokenized/checkout/create`,
+          {
+            mode: "0011",
+            payerReference: userId.toString(),
+            callbackURL: `${process.env.BACKEND_URL || "http://localhost:7000"}/payments/bkash/callback`,
+            amount: amount.toString(),
+            currency: "BDT",
+            intent: "sale",
+            merchantInvoiceNumber: merchantInvoiceNumber,
+          },
+          {
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: id_token,
+              "X-APP-Key": BKASH_CONFIG.app_key,
+            },
+          },
+        );
+
+        if (paymentResponse.data && paymentResponse.data.bkashURL) {
+          // Update payment record with bKash paymentID
+          await paymentCollection.updateOne(
+            { merchantInvoiceNumber },
+            {
+              $set: {
+                bkashPaymentID: paymentResponse.data.paymentID,
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+          res.json({
+            success: true,
+            bkashURL: paymentResponse.data.bkashURL,
+            paymentID: paymentResponse.data.paymentID,
+            merchantInvoiceNumber,
+          });
+        } else {
+          throw new Error("Failed to create bKash payment");
+        }
+      } catch (error) {
+        console.error("bKash create payment error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to create payment",
+          error: error.message,
+        });
+      }
+    });
+
+    // 2. bKash Callback URL (handles payment response)
+    // 2. bKash Callback URL (handles payment response)
+    app.get("/payments/bkash/callback", async (req, res) => {
+      try {
+        const { paymentID, status } = req.query;
+
+        console.log("bKash Callback received:", { paymentID, status });
+
+        if (status === "success" && paymentID) {
+          // First, find the payment by paymentID to get merchantInvoiceNumber
+          const payment = await paymentCollection.findOne({
+            bkashPaymentID: paymentID,
+          });
+
+          if (!payment) {
+            console.error("Payment not found for paymentID:", paymentID);
+            return res.redirect(
+              `${process.env.BKASH_FRONTEND_URL}/payment/failed?error=payment_not_found`,
+            );
+          }
+
+          // Execute payment
+          const executeResponse = await executeBkashPayment(paymentID);
+
+          if (executeResponse.success) {
+            // Update payment status and enroll user
+            await handleSuccessfulPayment(
+              executeResponse.data,
+              payment.merchantInvoiceNumber,
+            );
+
+            // Redirect to frontend success page with invoice
+            return res.redirect(
+              `${process.env.BKASH_FRONTEND_URL}/payment/success?invoice=${payment.merchantInvoiceNumber}`,
+            );
+          } else {
+            return res.redirect(
+              `${process.env.BKASH_FRONTEND_URL}/payment/failed?invoice=${payment.merchantInvoiceNumber}`,
+            );
+          }
+        } else {
+          // Payment failed or cancelled
+          // Try to find payment by paymentID if available
+          if (paymentID) {
+            const payment = await paymentCollection.findOne({
+              bkashPaymentID: paymentID,
+            });
+            if (payment) {
+              await paymentCollection.updateOne(
+                { _id: payment._id },
+                {
+                  $set: {
+                    status: "FAILED",
+                    updatedAt: new Date(),
+                  },
+                },
+              );
+              return res.redirect(
+                `${process.env.BKASH_FRONTEND_URL}/payment/failed?invoice=${payment.merchantInvoiceNumber}`,
+              );
+            }
+          }
+
+          return res.redirect(
+            `${process.env.BKASH_FRONTEND_URL}/payment/failed`,
+          );
+        }
+      } catch (error) {
+        console.error("bKash callback error:", error);
+        res.redirect(`${process.env.BKASH_FRONTEND_URL}/payment/error`);
+      }
+    });
+
+    // Helper function to execute bKash payment
+    // Helper function to execute bKash payment
+    async function executeBkashPayment(paymentID) {
+      try {
+        // Get new token for execution
+        const tokenResponse = await axios.post(
+          `${BKASH_CONFIG.base_url}/tokenized/checkout/token/grant`,
+          {
+            app_key: BKASH_CONFIG.app_key,
+            app_secret: BKASH_CONFIG.app_secret,
+          },
+          {
+            headers: {
+              "Content-Type": "application/json",
+              username: BKASH_CONFIG.username,
+              password: BKASH_CONFIG.password,
+            },
+          },
+        );
+
+        const id_token = tokenResponse.data.id_token;
+
+        // Execute payment
+        const executeResponse = await axios.post(
+          `${BKASH_CONFIG.base_url}/tokenized/checkout/execute`,
+          { paymentID },
+          {
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: id_token,
+              "X-APP-Key": BKASH_CONFIG.app_key,
+            },
+          },
+        );
+
+        console.log("bKash execute response:", executeResponse.data);
+        return { success: true, data: executeResponse.data };
+      } catch (error) {
+        console.error(
+          "Execute bKash payment error:",
+          error.response?.data || error.message,
+        );
+        return { success: false, error: error.message };
+      }
+    }
+
+    // Helper function to handle successful payment
+    // Helper function to handle successful payment
+    async function handleSuccessfulPayment(paymentData, merchantInvoiceNumber) {
+      try {
+        console.log("Handling successful payment:", {
+          paymentData,
+          merchantInvoiceNumber,
+        });
+
+        // Update payment record
+        await paymentCollection.updateOne(
+          { merchantInvoiceNumber },
+          {
+            $set: {
+              status: "COMPLETED",
+              trxID: paymentData.trxID,
+              paymentData: paymentData,
+              updatedAt: new Date(),
+            },
+          },
+        );
+
+        // Find payment to get userId and courseId
+        const payment = await paymentCollection.findOne({
+          merchantInvoiceNumber,
+        });
+
+        if (payment) {
+          // Get course details
+          const course = await courseCollection.findOne({
+            _id: payment.courseId,
+          });
+
+          // Calculate end date based on course duration
+          const daysToAdd = parseDurationToDays(course.duration);
+          const endDate = new Date(
+            Date.now() + daysToAdd * 24 * 60 * 60 * 1000,
+          );
+
+          // Enroll user in course
+          const enrollmentData = {
+            courseId: payment.courseId,
+            enrollmentDate: new Date(),
+            startDate: new Date(),
+            endDate: endDate,
+            status: "active",
+            progress: {
+              overall: 0,
+              completedChapters: [],
+              completedLessons: [],
+              completedTopics: [],
+              lastAccessed: new Date(),
+              timeSpent: 0,
+            },
+            certificate: {
+              issued: false,
+              issueDate: null,
+              certificateUrl: null,
+              certificateId: null,
+            },
+          };
+
+          await userCollection.updateOne(
+            { _id: payment.userId },
+            { $push: { enrolledCourses: enrollmentData } },
+          );
+
+          console.log("User enrolled successfully:", payment.userId);
+
+          // Send notification
+          await notificationService.sendToUser(payment.userId, {
+            type: "course",
+            message: `Payment successful! You're now enrolled in '${course.title}'`,
+            details: `Transaction ID: ${paymentData.trxID}`,
+            actionUrl: `/course/${course.slug || payment.courseId}`,
+          });
+        }
+      } catch (error) {
+        console.error("Handle successful payment error:", error);
+      }
+    }
+
+    // 3. Query payment status
+    app.get(
+      "/payments/status/:merchantInvoiceNumber",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { merchantInvoiceNumber } = req.params;
+          const userId = req.user.userId;
+
+          const payment = await paymentCollection.findOne({
+            merchantInvoiceNumber,
+            userId: new ObjectId(userId),
+          });
+
+          if (!payment) {
+            return res
+              .status(404)
+              .json({ success: false, message: "Payment not found" });
+          }
+
+          res.json({
+            success: true,
+            payment: {
+              status: payment.status,
+              amount: payment.amount,
+              trxID: payment.trxID,
+              createdAt: payment.createdAt,
+            },
+          });
+        } catch (error) {
+          console.error("Payment status error:", error);
+          res
+            .status(500)
+            .json({ success: false, message: "Failed to get payment status" });
+        }
+      },
+    );
+
+    // 4. Get payment history for user
+    app.get("/payments/history", authenticateToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const skip = (page - 1) * limit;
+
+        const payments = await paymentCollection
+          .find({ userId: new ObjectId(userId) })
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .toArray();
+
+        const total = await paymentCollection.countDocuments({
+          userId: new ObjectId(userId),
+        });
+
+        // Get course details for each payment
+        const paymentsWithCourses = await Promise.all(
+          payments.map(async (payment) => {
+            const course = await courseCollection.findOne(
+              { _id: payment.courseId },
+              { projection: { title: 1, thumbnail: 1 } },
+            );
+            return {
+              ...payment,
+              course,
+            };
+          }),
+        );
+
+        res.json({
+          success: true,
+          payments: paymentsWithCourses,
+          pagination: {
+            page,
+            limit,
+            total,
+            pages: Math.ceil(total / limit),
+          },
+        });
+      } catch (error) {
+        console.error("Payment history error:", error);
+        res
+          .status(500)
+          .json({ success: false, message: "Failed to get payment history" });
       }
     });
 
