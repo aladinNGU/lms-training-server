@@ -100,6 +100,7 @@ async function run() {
     const certificateCollection = db.collection("certificates");
     const paymentCollection = db.collection("payments");
     const emailLogCollection = db.collection("emailLogs");
+    const testimonialCollection = db.collection("testimonials");
 
     // Create indexes for better performance
     await courseCollection.createIndex({ slug: 1 }, { unique: true });
@@ -145,6 +146,10 @@ async function run() {
     await emailLogCollection.createIndex({ merchantInvoiceNumber: 1 });
     await emailLogCollection.createIndex({ sentAt: -1 });
     console.log("✅ Email logs indexes created");
+
+    // Create indexes for testimonials
+    await testimonialCollection.createIndex({ status: 1, isApproved: 1 });
+    await testimonialCollection.createIndex({ createdAt: -1 });
 
     // Middleware to check if user is admin
     // ============= FIXED isAdmin MIDDLEWARE =============
@@ -4976,6 +4981,315 @@ Course: ${course?.title || "N/A"}
         }
       },
     );
+
+    // ============= TESTIMONIALS API =============
+
+    // PUBLIC: Get approved testimonials for homepage
+    // GET random testimonials
+    app.get("/testimonials/random", async (req, res) => {
+      try {
+        const { count = 5 } = req.query;
+
+        // Using MongoDB aggregation to get random documents
+        const testimonials = await db
+          .collection("testimonials")
+          .aggregate([
+            { $match: { status: "active", isApproved: true } },
+            { $sample: { size: parseInt(count) } },
+          ])
+          .toArray();
+
+        res.json({
+          success: true,
+          testimonials,
+          count: testimonials.length,
+        });
+      } catch (error) {
+        console.error("Error fetching random testimonials:", error);
+        res.status(500).json({ message: "Server error" });
+      }
+    });
+
+    app.get("/testimonials", async (req, res) => {
+      try {
+        const { limit = 6, featured } = req.query;
+
+        let query = {
+          status: "active",
+          isApproved: true,
+        };
+
+        if (featured === "true") {
+          query.isFeatured = true;
+        }
+
+        const testimonials = await db
+          .collection("testimonials")
+          .find(query)
+          .sort({ createdAt: -1 })
+          .limit(parseInt(limit))
+          .toArray();
+
+        res.json({
+          success: true,
+          testimonials,
+          total: testimonials.length,
+        });
+      } catch (error) {
+        console.error("Error fetching testimonials:", error);
+        res.status(500).json({ message: "Server error" });
+      }
+    });
+
+    // PUBLIC: Submit a testimonial (for registered users)
+    app.post("/testimonials", authenticateToken, async (req, res) => {
+      try {
+        const { comment, rating, course } = req.body;
+
+        // Get user details
+        const user = await db
+          .collection("users")
+          .findOne({ _id: new ObjectId(req.user.userId) });
+
+        if (!user) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        const testimonial = {
+          name: user.name,
+          role: user.role === "student" ? "Student" : `${user.role} Student`,
+          avatar: user.name?.charAt(0).toUpperCase() || "S",
+          comment,
+          rating: parseInt(rating),
+          course: course || null,
+          userId: user._id,
+          isApproved: false, // Requires admin approval
+          isFeatured: false,
+          status: "pending",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await db
+          .collection("testimonials")
+          .insertOne(testimonial);
+
+        res.status(201).json({
+          success: true,
+          message: "Testimonial submitted for review",
+          testimonialId: result.insertedId,
+        });
+      } catch (error) {
+        console.error("Error submitting testimonial:", error);
+        res.status(500).json({ message: "Server error" });
+      }
+    });
+
+    // ADMIN: Get all testimonials with pagination and filters
+    app.get(
+      "/admin/testimonials",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const {
+            page = 1,
+            limit = 10,
+            status,
+            isApproved,
+            search,
+          } = req.query;
+
+          const skip = (parseInt(page) - 1) * parseInt(limit);
+          let query = {};
+
+          if (status) query.status = status;
+          if (isApproved !== undefined)
+            query.isApproved = isApproved === "true";
+
+          if (search) {
+            query.$or = [
+              { name: { $regex: search, $options: "i" } },
+              { comment: { $regex: search, $options: "i" } },
+            ];
+          }
+
+          const testimonials = await db
+            .collection("testimonials")
+            .find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(parseInt(limit))
+            .toArray();
+
+          const total = await db
+            .collection("testimonials")
+            .countDocuments(query);
+
+          res.json({
+            success: true,
+            testimonials,
+            pagination: {
+              page: parseInt(page),
+              limit: parseInt(limit),
+              total,
+              pages: Math.ceil(total / parseInt(limit)),
+            },
+          });
+        } catch (error) {
+          console.error("Error fetching admin testimonials:", error);
+          res.status(500).json({ message: "Server error" });
+        }
+      },
+    );
+
+    // ADMIN: Update testimonial status/approval
+    app.put(
+      "/admin/testimonials/:id",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          const {
+            status,
+            isApproved,
+            isFeatured,
+            comment,
+            rating,
+            name,
+            role,
+          } = req.body;
+
+          const updateData = {
+            updatedAt: new Date(),
+          };
+
+          if (status !== undefined) updateData.status = status;
+          if (isApproved !== undefined) updateData.isApproved = isApproved;
+          if (isFeatured !== undefined) updateData.isFeatured = isFeatured;
+          if (comment !== undefined) updateData.comment = comment;
+          if (rating !== undefined) updateData.rating = parseInt(rating);
+          if (name !== undefined) updateData.name = name;
+          if (role !== undefined) updateData.role = role;
+
+          const result = await db
+            .collection("testimonials")
+            .updateOne({ _id: new ObjectId(id) }, { $set: updateData });
+
+          if (result.matchedCount === 0) {
+            return res.status(404).json({ message: "Testimonial not found" });
+          }
+
+          res.json({
+            success: true,
+            message: "Testimonial updated successfully",
+          });
+        } catch (error) {
+          console.error("Error updating testimonial:", error);
+          res.status(500).json({ message: "Server error" });
+        }
+      },
+    );
+
+    // ADMIN: Delete testimonial
+    app.delete(
+      "/admin/testimonials/:id",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+
+          const result = await db.collection("testimonials").deleteOne({
+            _id: new ObjectId(id),
+          });
+
+          if (result.deletedCount === 0) {
+            return res.status(404).json({ message: "Testimonial not found" });
+          }
+
+          res.json({
+            success: true,
+            message: "Testimonial deleted successfully",
+          });
+        } catch (error) {
+          console.error("Error deleting testimonial:", error);
+          res.status(500).json({ message: "Server error" });
+        }
+      },
+    );
+
+    // ADMIN: Bulk actions on testimonials
+    app.post(
+      "/admin/testimonials/bulk",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const { action, testimonialIds, data } = req.body;
+
+          if (!testimonialIds || testimonialIds.length === 0) {
+            return res
+              .status(400)
+              .json({ message: "No testimonials selected" });
+          }
+
+          const objectIds = testimonialIds.map((id) => new ObjectId(id));
+          let updateData = {};
+
+          switch (action) {
+            case "approve":
+              updateData = {
+                isApproved: true,
+                status: "active",
+                updatedAt: new Date(),
+              };
+              break;
+            case "reject":
+              updateData = {
+                isApproved: false,
+                status: "rejected",
+                updatedAt: new Date(),
+              };
+              break;
+            case "feature":
+              updateData = { isFeatured: true, updatedAt: new Date() };
+              break;
+            case "unfeature":
+              updateData = { isFeatured: false, updatedAt: new Date() };
+              break;
+            case "delete":
+              const result = await db.collection("testimonials").deleteMany({
+                _id: { $in: objectIds },
+              });
+              return res.json({
+                success: true,
+                message: `Deleted ${result.deletedCount} testimonials`,
+              });
+            default:
+              return res.status(400).json({ message: "Invalid action" });
+          }
+
+          const result = await db
+            .collection("testimonials")
+            .updateMany({ _id: { $in: objectIds } }, { $set: updateData });
+
+          res.json({
+            success: true,
+            message: `Updated ${result.modifiedCount} testimonials`,
+          });
+        } catch (error) {
+          console.error("Error in bulk action:", error);
+          res.status(500).json({ message: "Server error" });
+        }
+      },
+    );
+
+    // Start server
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+    });
 
     // Health check endpoint
     app.get("/health", (req, res) => {
