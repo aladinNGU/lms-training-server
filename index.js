@@ -5,7 +5,6 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
 const axios = require("axios");
-const crypto = require("crypto");
 const { MongoClient, ObjectId, ServerApiVersion } = require("mongodb");
 require("dotenv").config();
 const PDFDocument = require("pdfkit");
@@ -14,7 +13,18 @@ const app = express();
 const PORT = process.env.PORT || 7000;
 
 // Middleware
-app.use(cors());
+app.use(
+  cors({
+    origin: [
+      "http://localhost:5173",
+      "http://localhost:7000",
+      "http://127.0.0.1:5174",
+    ],
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  }),
+);
 app.use(express.json());
 
 // bKash Configuration
@@ -64,27 +74,27 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    // ===== EMAIL CONFIGURATION VALIDATION =====
-    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-      console.warn(
-        "⚠️ Email credentials not configured. OTP emails will not be sent.",
-      );
-      console.warn("Please set EMAIL_USER and EMAIL_PASS in your .env file");
-    } else {
-      try {
-        const testTransporter = nodemailer.createTransport({
-          service: "gmail",
-          auth: {
-            user: process.env.EMAIL_USER,
-            pass: process.env.EMAIL_PASS,
-          },
-        });
-        await testTransporter.verify();
-        console.log("✅ Email configuration verified");
-      } catch (emailError) {
-        console.warn("⚠️ Email configuration invalid:", emailError.message);
-      }
-    }
+    // // ===== EMAIL CONFIGURATION VALIDATION =====
+    // if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    //   console.warn(
+    //     "⚠️ Email credentials not configured. OTP emails will not be sent.",
+    //   );
+    //   console.warn("Please set EMAIL_USER and EMAIL_PASS in your .env file");
+    // } else {
+    //   try {
+    //     const testTransporter = nodemailer.createTransport({
+    //       service: "gmail",
+    //       auth: {
+    //         user: process.env.EMAIL_USER,
+    //         pass: process.env.EMAIL_PASS,
+    //       },
+    //     });
+    //     await testTransporter.verify();
+    //     console.log("✅ Email configuration verified");
+    //   } catch (emailError) {
+    //     console.warn("⚠️ Email configuration invalid:", emailError.message);
+    //   }
+    // }
 
     // Connect the client to the server
     await client.connect();
@@ -101,6 +111,7 @@ async function run() {
     const paymentCollection = db.collection("payments");
     const emailLogCollection = db.collection("emailLogs");
     const testimonialCollection = db.collection("testimonials");
+    const contactCollection = db.collection("contacts");
 
     // Create indexes for better performance
     await courseCollection.createIndex({ slug: 1 }, { unique: true });
@@ -152,8 +163,6 @@ async function run() {
     await testimonialCollection.createIndex({ createdAt: -1 });
 
     // Middleware to check if user is admin
-    // ============= FIXED isAdmin MIDDLEWARE =============
-    // ============= IMPROVED isAdmin MIDDLEWARE =============
     async function isAdmin(req, res, next) {
       try {
         // Check if req.user exists
@@ -343,6 +352,101 @@ async function run() {
       },
     };
 
+    app.post("/contact", async (req, res) => {
+      try {
+        console.log("📝 Contact form submission received:", req.body);
+
+        const { name, email, phone, subject, message } = req.body;
+
+        // Validate required fields
+        if (!name || !email || !subject || !message) {
+          return res.status(400).json({
+            error: "Please fill all required fields",
+          });
+        }
+
+        // Validate email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+          return res.status(400).json({ error: "Invalid email format" });
+        }
+
+        // Use lmsDB (your main database)
+        const db = client.db("lmsDB");
+        const contacts = db.collection("contacts");
+
+        const contactData = {
+          name,
+          email,
+          phone: phone || "",
+          subject,
+          message,
+          status: "pending",
+          createdAt: new Date(),
+          userAgent: req.headers["user-agent"],
+          ip: req.ip || req.connection.remoteAddress,
+        };
+
+        console.log("💾 Saving to database:", contactData);
+        const result = await contacts.insertOne(contactData);
+        console.log("✅ Saved with ID:", result.insertedId);
+
+        // Send email to user (non-blocking)
+        if (transporter) {
+          transporter
+            .sendMail({
+              from: process.env.EMAIL_USER,
+              to: email,
+              subject: "Thank you for contacting LMS",
+              html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #4f46e5;">Thank You for Contacting Us!</h2>
+            <p>Dear ${name},</p>
+            <p>We have received your message and will get back to you within 24-48 hours.</p>
+            <div style="background: #f3f4f6; padding: 20px; border-radius: 8px; margin: 20px 0;">
+              <p><strong>Subject:</strong> ${subject}</p>
+              <p><strong>Message:</strong> ${message}</p>
+            </div>
+            <p>Best regards,<br>LMS Support Team</p>
+          </div>
+        `,
+            })
+            .catch((err) => console.error("Email error:", err));
+
+          // Send admin notification
+          transporter
+            .sendMail({
+              from: process.env.EMAIL_USER,
+              to: process.env.ADMIN_EMAIL || "teams.rcsbd@gmail.com",
+              subject: "New Contact Form Submission",
+              html: `
+          <div style="font-family: Arial, sans-serif;">
+            <h2>New Contact Form Submission</h2>
+            <p><strong>Name:</strong> ${name}</p>
+            <p><strong>Email:</strong> ${email}</p>
+            <p><strong>Phone:</strong> ${phone || "Not provided"}</p>
+            <p><strong>Subject:</strong> ${subject}</p>
+            <p><strong>Message:</strong> ${message}</p>
+          </div>
+        `,
+            })
+            .catch((err) => console.error("Admin email error:", err));
+        }
+
+        res.status(201).json({
+          success: true,
+          message: "Contact form submitted successfully",
+          contactId: result.insertedId,
+        });
+      } catch (error) {
+        console.error("❌ Contact form error:", error);
+        res.status(500).json({
+          error: "Failed to submit contact form",
+          details: error.message,
+        });
+      }
+    });
+
     // Helper function to handle course completion (UPDATED WITH NOTIFICATION)
     async function handleCourseCompletion(userId, courseId) {
       const user = await userCollection.findOne({ _id: new ObjectId(userId) });
@@ -365,7 +469,7 @@ async function run() {
         grade: "A",
         percentage: 100,
         duration: course.duration,
-        instructorName: "Dr. Smith",
+        instructorName: "Mohammad Alauddin",
         certificateUrl,
         verificationHash: generateVerificationHash(),
         isVerified: true,
@@ -417,35 +521,8 @@ async function run() {
       return lessons.map((l) => l._id);
     }
 
-    // TEMPORARY DEBUG ROUTE - Add this before your stats route
-    app.get("/admin/debug/token", authenticateToken, async (req, res) => {
-      try {
-        console.log("🔍 Debug: Token user data:", req.user);
-
-        // Check if userId exists and is valid
-        const userId = req.user?.userId;
-        const isValid = userId ? ObjectId.isValid(userId) : false;
-
-        res.json({
-          success: true,
-          debug: {
-            userId: userId,
-            isValid: isValid,
-            user: req.user,
-          },
-        });
-      } catch (error) {
-        res.status(500).json({ error: error.message });
-      }
-    });
-
-    // 7. GET user statistics for dashboard
-    // 7. GET user statistics for dashboard (FIXED)
-    // ============= FIXED USER STATS ROUTE =============
-    // 7. GET user statistics for dashboard
     // 7. GET user statistics for dashboard (FIXED WITH ERROR HANDLING)
     // ============= FIXED USER STATS ROUTE =============
-    // ============= IMPROVED USER STATS ROUTE =============
     app.get(
       "/admin/users/stats",
       authenticateToken,
@@ -536,9 +613,6 @@ async function run() {
       },
     );
 
-    // 1. GET all users with pagination and filters
-    // 1. GET all users with pagination and filters (UPDATED)
-    // ============= GET ALL USERS WITH STATS =============
     // ============= GET ALL USERS WITH STATS =============
     app.get("/admin/users", authenticateToken, isAdmin, async (req, res) => {
       try {
@@ -760,9 +834,7 @@ async function run() {
     });
 
     // ============= ADMIN USER MANAGEMENT ROUTES =============
-
     // 2. GET single user details with full info
-    // ============= FIXED GET SINGLE USER DETAILS ROUTE =============
     app.get(
       "/admin/users/:userId",
       authenticateToken,
@@ -1006,7 +1078,6 @@ async function run() {
     );
 
     // ============= AUTH ROUTES =============
-
     // Register new user
     app.post("/auth/register", async (req, res) => {
       try {
@@ -1164,7 +1235,6 @@ async function run() {
     });
 
     // ============= PASSWORD RESET WITH OTP =============
-
     // Request OTP for password reset
     app.post("/auth/forgot-password", async (req, res) => {
       try {
@@ -1196,7 +1266,7 @@ async function run() {
         const mailOptions = {
           from: process.env.EMAIL_USER,
           to: email,
-          subject: "Password Reset OTP - LMS Academy",
+          subject: "Password Reset OTP - Reliable Code Solutions",
           html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
           <h2 style="color: #0D9488;">Password Reset Request</h2>
@@ -1326,9 +1396,7 @@ async function run() {
     });
 
     // ============= USER PROFILE ROUTES =============
-
     // Get user profile
-    // ============= OPTIMIZED USER PROFILE ROUTE =============
     app.get("/users/profile", authenticateToken, async (req, res) => {
       try {
         const userId = req.user.userId;
@@ -1440,100 +1508,6 @@ async function run() {
 
       return 90; // Default fallback
     }
-    // Enroll in a course (UPDATED WITH NOTIFICATION)
-    // app.post("/users/enroll/:courseId", authenticateToken, async (req, res) => {
-    //   try {
-    //     const { courseId } = req.params;
-    //     const userId = req.user.userId;
-
-    //     // Check if course exists
-    //     const course = await courseCollection.findOne({
-    //       _id: new ObjectId(courseId),
-    //     });
-
-    //     if (!course) {
-    //       return res
-    //         .status(404)
-    //         .json({ success: false, message: "Course not found" });
-    //     }
-
-    //     // Check if already enrolled
-    //     const user = await userCollection.findOne({
-    //       _id: new ObjectId(userId),
-    //       "enrolledCourses.courseId": new ObjectId(courseId),
-    //     });
-
-    //     if (user) {
-    //       return res.status(400).json({
-    //         success: false,
-    //         message: "Already enrolled in this course",
-    //       });
-    //     }
-
-    //     // Get course structure for progress tracking
-    //     const chapters = await chapterCollection
-    //       .find({ courseId: new ObjectId(courseId) })
-    //       .toArray();
-
-    //     const lessons = await lessonCollection
-    //       .find({ chapterId: { $in: chapters.map((c) => c._id) } })
-    //       .toArray();
-
-    //     const topics = await topicCollection
-    //       .find({ lessonId: { $in: lessons.map((l) => l._id) } })
-    //       .toArray();
-
-    //     const enrollmentData = {
-    //       courseId: new ObjectId(courseId),
-    //       enrollmentDate: new Date(),
-    //       startDate: new Date(),
-    //       endDate: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000), // 90 days from now
-    //       status: "active",
-    //       progress: {
-    //         overall: 0,
-    //         completedChapters: [],
-    //         completedLessons: [],
-    //         completedTopics: [],
-    //         lastAccessed: new Date(),
-    //         timeSpent: 0,
-    //       },
-    //       certificate: {
-    //         issued: false,
-    //         issueDate: null,
-    //         certificateUrl: null,
-    //         certificateId: null,
-    //       },
-    //     };
-
-    //     await userCollection.updateOne(
-    //       { _id: new ObjectId(userId) },
-    //       { $push: { enrolledCourses: enrollmentData } },
-    //     );
-
-    //     // ===== ADD NOTIFICATION =====
-    //     await notificationService.sendToUser(userId, {
-    //       type: "course",
-    //       message: `You have successfully enrolled in '${course.title}'`,
-    //       details: "Start your learning journey today!",
-    //       actionUrl: `/course/${course.slug || courseId}`,
-    //     });
-
-    //     res.json({
-    //       success: true,
-    //       message: "Successfully enrolled in course",
-    //       enrollment: enrollmentData,
-    //     });
-    //   } catch (error) {
-    //     console.error("Enrollment error:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       message: "Failed to enroll",
-    //       error: error.message,
-    //     });
-    //   }
-    // });
-
-    // In your backend/index.js - Update the enrollment route
 
     // Enroll in a course (UPDATED)
     app.post("/users/enroll/:courseId", authenticateToken, async (req, res) => {
@@ -1721,7 +1695,6 @@ async function run() {
       },
     );
 
-    // Get user's enrolled courses with progress
     // Get user's enrolled courses with progress
     app.get("/users/my-courses", authenticateToken, async (req, res) => {
       try {
@@ -1957,8 +1930,6 @@ async function run() {
         }
       },
     );
-
-    // In your backend/index.js, find the notifications route and update it:
 
     // Get user notifications (OPTIMIZED)
     app.get("/users/notifications", authenticateToken, async (req, res) => {
@@ -2305,7 +2276,6 @@ async function run() {
     });
 
     // PUT update course
-    // PUT update course (COMPLETE FIX)
     app.put("/courses/:id", async (req, res) => {
       try {
         const { id } = req.params;
@@ -3104,7 +3074,6 @@ async function run() {
     });
 
     // ============= TOPIC ROUTES =============
-
     // GET all topics for a lesson
     app.get("/lessons/:lessonId/topics", async (req, res) => {
       try {
@@ -3433,7 +3402,6 @@ async function run() {
     );
 
     // Get enrolled students count for a course
-    // Get enrolled students count for a course
     app.get("/courses/:courseId/enrolled-count", async (req, res) => {
       try {
         const { courseId } = req.params;
@@ -3587,7 +3555,6 @@ async function run() {
     });
 
     // 2. bKash Callback URL (handles payment response)
-    // ============= UPDATE THE CALLBACK HANDLER =============
     app.get("/payments/bkash/callback", async (req, res) => {
       try {
         const { paymentID, status } = req.query;
@@ -3738,7 +3705,6 @@ async function run() {
     }
 
     // 3. Query payment status
-    // 3. Query payment status (UPDATED with more data)
     app.get(
       "/payments/status/:merchantInvoiceNumber",
       authenticateToken,
@@ -3882,7 +3848,7 @@ async function run() {
           }
           .header p {
             margin: 10px 0 0;
-            color: rgba(255,255,255,0.9);
+            color:black;
             font-size: 16px;
           }
           .content {
@@ -4060,9 +4026,8 @@ async function run() {
             <div style="margin: 30px 0; padding: 20px; background: #F3F4F6; border-radius: 8px;">
               <h4 style="margin-top: 0;">📱 Need Help?</h4>
               <p>If you have any questions about your purchase or need technical support:</p>
-              <p>📧 Email: support@lmsacademy.com<br>
-              📞 Phone: +880 1234-567890<br>
-              💬 Live Chat: Available 24/7 on our website</p>
+              <p>📧 Email: teams.rcsbd@gmail.com<br>
+              📞 Phone: +880 1715697780<br>
             </div>
           </div>
           
@@ -4073,8 +4038,8 @@ async function run() {
               <a href="#">LinkedIn</a> • 
               <a href="#">Instagram</a>
             </div>
-            <p>© ${new Date().getFullYear()} LMS Academy. All rights reserved.</p>
-            <p>123 Gulshan Avenue, Dhaka 1212, Bangladesh</p>
+            <p>© ${new Date().getFullYear()} Reliable Code Solutions. All rights reserved.</p>
+            <p>1212 East Shewrapara, Mirpur, Dhaka 1216, Bangladesh</p>
             <p style="font-size: 12px;">This is a system generated email. Please do not reply to this email.</p>
           </div>
         </div>
@@ -4085,7 +4050,7 @@ async function run() {
 
       // Invoice PDF Template (for attachment - optional)
       invoiceTemplate: (data) => `
-    LMS ACADEMY - OFFICIAL RECEIPT
+    Reliable Code Solutions - OFFICIAL RECEIPT
     ==============================
     
     Receipt No: ${data.merchantInvoiceNumber}
@@ -4150,7 +4115,7 @@ async function run() {
             trxID: paymentData.trxID,
             merchantInvoiceNumber: paymentData.merchantInvoiceNumber,
             paymentDate: paymentData.updatedAt || new Date(),
-            instructorName: courseData.instructorName || "Dr. Smith",
+            instructorName: courseData.instructorName || "Mohammad Alauddin",
           };
 
           // Get email template
@@ -4162,7 +4127,7 @@ async function run() {
           // Send email
           const mailOptions = {
             from: {
-              name: "LMS Academy",
+              name: "Reliable Code Solutions",
               address: process.env.EMAIL_USER,
             },
             to: userData.email,
@@ -4177,7 +4142,8 @@ async function run() {
             // ]
           };
 
-          const info = await transporter.sendMail(mailOptions);
+          // const info = await transporter.sendMail(mailOptions);
+          const info = transporter.sendMail(mailOptions);
           console.log("✅ Payment confirmation email sent:", info.messageId);
 
           // Log email in database
@@ -4213,7 +4179,7 @@ async function run() {
       // Send payment receipt to admin (optional)
       sendAdminNotification: async (paymentData, userData, courseData) => {
         try {
-          const adminEmail = process.env.ADMIN_EMAIL || "admin@lmsacademy.com";
+          const adminEmail = process.env.ADMIN_EMAIL || "teams.rcsbd@gmail.com";
 
           const mailOptions = {
             from: process.env.EMAIL_USER,
@@ -4238,8 +4204,6 @@ async function run() {
       },
     };
 
-    // ============= UPDATE THE HANDLE SUCCESSFUL PAYMENT FUNCTION =============
-    // Replace your existing handleSuccessfulPayment function with this:
     // ============= UPDATE THE HANDLE SUCCESSFUL PAYMENT FUNCTION =============
     async function handleSuccessfulPayment(bKashData, merchantInvoiceNumber) {
       try {
@@ -4381,97 +4345,6 @@ async function run() {
       }
     }
 
-    // ============= ADD PAYMENT RECEIPT DOWNLOAD ROUTE =============
-
-    // Download payment receipt
-    // Download payment receipt (UPDATED)
-    //     app.get(
-    //       "/payments/receipt/:merchantInvoiceNumber",
-    //       authenticateToken,
-    //       async (req, res) => {
-    //         try {
-    //           const { merchantInvoiceNumber } = req.params;
-    //           const userId = req.user.userId;
-
-    //           const payment = await paymentCollection.findOne({
-    //             merchantInvoiceNumber,
-    //             userId: new ObjectId(userId),
-    //           });
-
-    //           if (!payment) {
-    //             return res
-    //               .status(404)
-    //               .json({ success: false, message: "Payment not found" });
-    //           }
-
-    //           const course = await courseCollection.findOne({
-    //             _id: payment.courseId,
-    //           });
-    //           const user = await userCollection.findOne({ _id: userId });
-
-    //           // Generate receipt with actual transaction ID
-    //           const receipt = `
-    // ===========================================
-    //           LMS ACADEMY
-    //       OFFICIAL PAYMENT RECEIPT
-    // ===========================================
-
-    // Receipt No: ${payment.merchantInvoiceNumber}
-    // Date: ${new Date(payment.updatedAt || payment.createdAt).toLocaleDateString("en-BD", { timeZone: "Asia/Dhaka" })}
-    // Time: ${new Date(payment.updatedAt || payment.createdAt).toLocaleTimeString("en-BD", { timeZone: "Asia/Dhaka" })}
-
-    // -------------------------------------------
-    // STUDENT INFORMATION
-    // -------------------------------------------
-    // Name: ${user?.name || "N/A"}
-    // Email: ${user?.email || "N/A"}
-    // Student ID: ${user?.uniqueId || "N/A"}
-
-    // -------------------------------------------
-    // PAYMENT DETAILS
-    // -------------------------------------------
-    // Transaction ID: ${payment.trxID || payment.paymentData?.trxID || "N/A"}
-    // Payment Method: bKash
-    // Amount: ৳${payment.amount?.toLocaleString() || "0"}
-    // Status: PAID ✓
-
-    // -------------------------------------------
-    // COURSE INFORMATION
-    // -------------------------------------------
-    // Course: ${course?.title || "N/A"}
-    // Duration: ${course?.duration || "N/A"}
-    // Level: ${course?.level || "N/A"}
-
-    // -------------------------------------------
-    // SUMMARY
-    // -------------------------------------------
-    // Subtotal: ৳${payment.amount?.toLocaleString() || "0"}
-    // VAT (0%): ৳0
-    // Total Paid: ৳${payment.amount?.toLocaleString() || "0"}
-
-    // ===========================================
-    // This is a computer generated receipt.
-    // For any queries, contact: support@lmsacademy.com
-    // ===========================================
-    //     `;
-
-    //           res.setHeader("Content-Type", "text/plain");
-    //           res.setHeader(
-    //             "Content-Disposition",
-    //             `attachment; filename=receipt-${merchantInvoiceNumber}.txt`,
-    //           );
-    //           res.send(receipt);
-    //         } catch (error) {
-    //           console.error("Download receipt error:", error);
-    //           res
-    //             .status(500)
-    //             .json({ success: false, message: "Failed to download receipt" });
-    //         }
-    //       },
-    //     );
-
-    // ============= PDF GENERATION WITH PDFKIT =============
-
     // Helper function to format date
     const formatDate = (date) => {
       return new Date(date).toLocaleDateString("en-BD", {
@@ -4493,10 +4366,10 @@ async function run() {
             margin: 50,
             info: {
               Title: `Payment Receipt - ${payment.merchantInvoiceNumber}`,
-              Author: "LMS Academy",
+              Author: "Reliable Code Solutions",
               Subject: "Course Payment Receipt",
               Keywords: "receipt, payment, lms",
-              Creator: "LMS Academy",
+              Creator: "Reliable Code Solutions",
             },
           });
 
@@ -4524,7 +4397,7 @@ async function run() {
           doc
             .fontSize(10)
             .fillColor("#6B7280")
-            .text("123 Gulshan Avenue, Dhaka 1212, Bangladesh", {
+            .text("1212 East Shewrapara, Mirpur, Dhaka 1216, Bangladesh", {
               align: "center",
             });
 
@@ -4758,11 +4631,11 @@ async function run() {
               { align: "center" },
             )
             .text(
-              "For any queries, contact: support@lmsacademy.com | +880 1234-567890",
+              "For any queries, contact: teams.rcsbd@gmail.com | +880 1715697780",
               { align: "center" },
             )
             .text(
-              `© ${new Date().getFullYear()} LMS Academy. All rights reserved.`,
+              `© ${new Date().getFullYear()} Reliable Code Solutions. All rights reserved.`,
               { align: "center" },
             );
 
@@ -4785,7 +4658,6 @@ async function run() {
       });
     };
 
-    // ===== UPDATE THE DOWNLOAD RECEIPT ROUTE =====
     // ===== UPDATED PDF RECEIPT DOWNLOAD ROUTE =====
     app.get(
       "/payments/receipt/:merchantInvoiceNumber",
@@ -4866,7 +4738,7 @@ async function run() {
             // Fallback to text receipt if PDF fails
             const fallbackReceipt = `
 ===========================================
-          LMS ACADEMY
+      Reliable Code Solutions
       OFFICIAL PAYMENT RECEIPT
 ===========================================
 
@@ -4983,7 +4855,6 @@ Course: ${course?.title || "N/A"}
     );
 
     // ============= TESTIMONIALS API =============
-
     // PUBLIC: Get approved testimonials for homepage
     // GET random testimonials
     app.get("/testimonials/random", async (req, res) => {
@@ -5285,6 +5156,85 @@ Course: ${course?.title || "N/A"}
         }
       },
     );
+
+    // Get all contacts (admin only)
+    app.get("/contacts", authenticateToken, isAdmin, async (req, res) => {
+      try {
+        const { page = 1, limit = 10, status } = req.query;
+        const query = status ? { status } : {};
+
+        const contactsList = await contactCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .skip((page - 1) * limit)
+          .limit(parseInt(limit))
+          .toArray();
+
+        const total = await contactCollection.countDocuments(query);
+
+        res.json({
+          contacts: contactsList,
+          total,
+          page: parseInt(page),
+          totalPages: Math.ceil(total / limit),
+        });
+      } catch (error) {
+        console.error("Error fetching contacts:", error);
+        res.status(500).json({ error: "Failed to fetch contacts" });
+      }
+    });
+
+    // Get single contact by ID (admin only)
+    app.get("/contacts/:id", authenticateToken, isAdmin, async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ error: "Invalid contact ID format" });
+        }
+
+        const db = client.db("lmsDB");
+        const contacts = db.collection("contacts");
+
+        const contact = await contacts.findOne({ _id: new ObjectId(id) });
+
+        if (!contact) {
+          return res.status(404).json({ error: "Contact not found" });
+        }
+
+        res.json({ success: true, contact });
+      } catch (error) {
+        console.error("Error fetching contact:", error);
+        res.status(500).json({ error: "Failed to fetch contact" });
+      }
+    });
+
+    // Update contact status (admin only)
+    app.patch("/contacts/:id", authenticateToken, isAdmin, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { status, response } = req.body;
+
+        const updateData = {
+          ...(status && { status }),
+          ...(response && { response, respondedAt: new Date() }),
+        };
+
+        const result = await contactCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateData },
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ error: "Contact not found" });
+        }
+
+        res.json({ success: true, message: "Contact updated successfully" });
+      } catch (error) {
+        console.error("Error updating contact:", error);
+        res.status(500).json({ error: "Failed to update contact" });
+      }
+    });
 
     // Start server
     app.listen(PORT, () => {
