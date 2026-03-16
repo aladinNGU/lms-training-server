@@ -5236,6 +5236,143 @@ Course: ${course?.title || "N/A"}
       }
     });
 
+    // Bulk actions on contacts (admin only)
+    app.post("/contacts/bulk", authenticateToken, isAdmin, async (req, res) => {
+      try {
+        const { action, contactIds } = req.body;
+
+        if (!contactIds || contactIds.length === 0) {
+          return res.status(400).json({ error: "No contacts selected" });
+        }
+
+        const objectIds = contactIds.map((id) => new ObjectId(id));
+
+        let result;
+        switch (action) {
+          case "markResponded":
+            result = await contactCollection.updateMany(
+              { _id: { $in: objectIds } },
+              { $set: { status: "responded", updatedAt: new Date() } },
+            );
+            break;
+          case "markClosed":
+            result = await contactCollection.updateMany(
+              { _id: { $in: objectIds } },
+              { $set: { status: "closed", updatedAt: new Date() } },
+            );
+            break;
+          case "delete":
+            result = await contactCollection.deleteMany({
+              _id: { $in: objectIds },
+            });
+            break;
+          default:
+            return res.status(400).json({ error: "Invalid action" });
+        }
+
+        res.json({
+          success: true,
+          message: `Bulk action '${action}' completed`,
+          modifiedCount: result.modifiedCount || result.deletedCount,
+        });
+      } catch (error) {
+        console.error("Error in bulk action:", error);
+        res.status(500).json({ error: "Failed to perform bulk action" });
+      }
+    });
+
+    // Send email response
+    app.post(
+      "/contacts/:id/send-email",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+          const { response, subject } = req.body;
+
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: "Invalid contact ID format" });
+          }
+
+          const db = client.db("lmsDB");
+          const contacts = db.collection("contacts");
+
+          const contact = await contacts.findOne({ _id: new ObjectId(id) });
+
+          if (!contact) {
+            return res.status(404).json({ error: "Contact not found" });
+          }
+
+          // Send email using your existing transporter
+          const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: contact.email,
+            subject: subject || `Re: ${contact.subject}`,
+            html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2 style="color: #4f46e5;">Response to Your Inquiry</h2>
+          <p>Dear ${contact.name},</p>
+          <div style="background: #f3f4f6; padding: 20px; border-radius: 8px; margin: 20px 0;">
+            ${response.replace(/\n/g, "<br/>")}
+          </div>
+          <p>Best regards,<br>LMS Support Team</p>
+        </div>
+      `,
+          };
+
+          await transporter.sendMail(mailOptions);
+
+          // Update contact with response and mark as responded
+          await contacts.updateOne(
+            { _id: new ObjectId(id) },
+            {
+              $set: {
+                response,
+                status: "responded",
+                respondedAt: new Date(),
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+          res.json({ success: true, message: "Email sent successfully" });
+        } catch (error) {
+          console.error("Error sending email:", error);
+          res.status(500).json({ error: "Failed to send email" });
+        }
+      },
+    );
+
+    // Delete contact
+    app.delete(
+      "/contacts/:id",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const { id } = req.params;
+
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: "Invalid contact ID format" });
+          }
+
+          const db = client.db("lmsDB");
+          const contacts = db.collection("contacts");
+
+          const result = await contacts.deleteOne({ _id: new ObjectId(id) });
+
+          if (result.deletedCount === 0) {
+            return res.status(404).json({ error: "Contact not found" });
+          }
+
+          res.json({ success: true, message: "Contact deleted successfully" });
+        } catch (error) {
+          console.error("Error deleting contact:", error);
+          res.status(500).json({ error: "Failed to delete contact" });
+        }
+      },
+    );
     // Start server
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
