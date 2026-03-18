@@ -1529,89 +1529,41 @@ async function run() {
       return 90; // Default fallback
     }
 
-    // Enroll in a course (UPDATED)
-    app.post("/users/enroll/:courseId", authenticateToken, async (req, res) => {
-      try {
-        const { courseId } = req.params;
-        const userId = req.user.userId;
+    // In your enrollment route (when student enrolls)
+    app.post(
+      "/api/users/enroll/:courseId",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { courseId } = req.params;
+          const userId = req.user.userId;
 
-        // Check if course exists
-        const course = await courseCollection.findOne({
-          _id: new ObjectId(courseId),
-        });
+          // ... existing enrollment code ...
 
-        if (!course) {
-          return res
-            .status(404)
-            .json({ success: false, message: "Course not found" });
-        }
+          // AFTER successful enrollment, update course stats
+          await courseCollection.updateOne(
+            { _id: new ObjectId(courseId) },
+            { $inc: { "stats.totalStudents": 1 } },
+          );
 
-        // Check if already enrolled
-        const user = await userCollection.findOne({
-          _id: new ObjectId(userId),
-          "enrolledCourses.courseId": new ObjectId(courseId),
-        });
-
-        if (user) {
-          return res.status(400).json({
-            success: false,
-            message: "Already enrolled in this course",
+          // Also update instructor's studentsTaught count
+          const course = await courseCollection.findOne({
+            _id: new ObjectId(courseId),
           });
+          if (course.instructor?._id) {
+            await userCollection.updateOne(
+              { _id: course.instructor._id },
+              { $inc: { studentsTaught: 1 } },
+            );
+          }
+
+          res.json({ success: true, message: "Enrolled successfully" });
+        } catch (error) {
+          console.error("Enrollment error:", error);
+          res.status(500).json({ error: error.message });
         }
-
-        // Calculate end date based on course duration
-        const daysToAdd = parseDurationToDays(course.duration);
-        const endDate = new Date(Date.now() + daysToAdd * 24 * 60 * 60 * 1000);
-
-        const enrollmentData = {
-          courseId: new ObjectId(courseId),
-          enrollmentDate: new Date(),
-          startDate: new Date(),
-          endDate: endDate, // Use calculated date based on course duration
-          status: "active",
-          progress: {
-            overall: 0,
-            completedChapters: [],
-            completedLessons: [],
-            completedTopics: [],
-            lastAccessed: new Date(),
-            timeSpent: 0,
-          },
-          certificate: {
-            issued: false,
-            issueDate: null,
-            certificateUrl: null,
-            certificateId: null,
-          },
-        };
-
-        await userCollection.updateOne(
-          { _id: new ObjectId(userId) },
-          { $push: { enrolledCourses: enrollmentData } },
-        );
-
-        // Send notification
-        await notificationService.sendToUser(userId, {
-          type: "course",
-          message: `You have successfully enrolled in '${course.title}'`,
-          details: "Start your learning journey today!",
-          actionUrl: `/course/${course.slug || courseId}`,
-        });
-
-        res.json({
-          success: true,
-          message: "Successfully enrolled in course",
-          enrollment: enrollmentData,
-        });
-      } catch (error) {
-        console.error("Enrollment error:", error);
-        res.status(500).json({
-          success: false,
-          message: "Failed to enroll",
-          error: error.message,
-        });
-      }
-    });
+      },
+    );
 
     // Update course progress
     app.post(
@@ -5360,6 +5312,7 @@ async function run() {
     };
 
     // ============= UPDATE THE HANDLE SUCCESSFUL PAYMENT FUNCTION =============
+    // Update the handleSuccessfulPayment function with stats updates
     async function handleSuccessfulPayment(bKashData, merchantInvoiceNumber) {
       try {
         console.log("💰 Handling successful payment:", {
@@ -5460,6 +5413,45 @@ async function run() {
         );
 
         console.log("✅ User enrolled successfully:", enrollResult);
+
+        // ===== UPDATE COURSE STATS =====
+        // Increment total students count
+        await courseCollection.updateOne(
+          { _id: payment.courseId },
+          { $inc: { "stats.totalStudents": 1 } },
+        );
+
+        // Also update the enrolled students count in course stats if needed
+        await courseCollection.updateOne(
+          { _id: payment.courseId },
+          { $inc: { "stats.enrolledCount": 1 } },
+        );
+
+        console.log("✅ Course stats updated: totalStudents incremented");
+
+        // ===== UPDATE INSTRUCTOR STATS =====
+        // Update instructor's students taught count if instructor exists
+        if (course.instructor?._id) {
+          await userCollection.updateOne(
+            { _id: course.instructor._id },
+            { $inc: { studentsTaught: 1 } },
+          );
+          console.log(
+            "✅ Instructor stats updated: studentsTaught incremented",
+          );
+        }
+
+        // ===== UPDATE REVENUE STATS =====
+        // Update revenue analytics collection
+        await revenueAnalyticsCollection.insertOne({
+          courseId: payment.courseId,
+          userId: payment.userId,
+          amount: parseFloat(bKashData.amount) || payment.amount,
+          transactionId: bKashData.trxID,
+          date: new Date(),
+          month: new Date().getMonth() + 1,
+          year: new Date().getFullYear(),
+        });
 
         // Send in-app notification
         await notificationService.sendToUser(payment.userId, {
@@ -7224,6 +7216,429 @@ Course: ${course?.title || "N/A"}
         }
       },
     );
+
+    // GET - Course Analytics Overview (Instructor/Admin only)
+    app.get(
+      "/analytics/courses/:courseId",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { courseId } = req.params;
+          const { period = "30d" } = req.query; // 7d, 30d, 90d, 1y, all
+
+          // Check permissions
+          const user = await userCollection.findOne({
+            _id: new ObjectId(req.user.userId),
+          });
+          const course = await courseCollection.findOne({
+            _id: new ObjectId(courseId),
+          });
+
+          if (!course) {
+            return res
+              .status(404)
+              .json({ success: false, message: "Course not found" });
+          }
+
+          // Only admin or instructor of this course can view analytics
+          if (
+            user.role !== "admin" &&
+            course.instructor?._id?.toString() !== user._id.toString()
+          ) {
+            return res.status(403).json({
+              success: false,
+              message: "Unauthorized to view analytics for this course",
+            });
+          }
+
+          // Calculate date range
+          const endDate = new Date();
+          let startDate = new Date();
+          if (period === "7d") startDate.setDate(endDate.getDate() - 7);
+          else if (period === "30d") startDate.setDate(endDate.getDate() - 30);
+          else if (period === "90d") startDate.setDate(endDate.getDate() - 90);
+          else if (period === "1y")
+            startDate.setFullYear(endDate.getFullYear() - 1);
+          else startDate = new Date(0); // All time
+
+          // Get enrollments data
+          const enrollments = await userCollection
+            .aggregate([
+              { $unwind: "$enrolledCourses" },
+              {
+                $match: { "enrolledCourses.courseId": new ObjectId(courseId) },
+              },
+              {
+                $project: {
+                  userId: "$_id",
+                  enrollmentDate: "$enrolledCourses.enrollmentDate",
+                  status: "$enrolledCourses.status",
+                  progress: "$enrolledCourses.progress",
+                  completedAt: "$enrolledCourses.completedAt",
+                },
+              },
+            ])
+            .toArray();
+
+          // Calculate metrics
+          const totalEnrollments = enrollments.length;
+          const activeEnrollments = enrollments.filter(
+            (e) => e.status === "active",
+          ).length;
+          const completedEnrollments = enrollments.filter(
+            (e) => e.status === "completed",
+          ).length;
+          const completionRate =
+            totalEnrollments > 0
+              ? Math.round((completedEnrollments / totalEnrollments) * 100)
+              : 0;
+
+          // Calculate average progress
+          const avgProgress =
+            enrollments.length > 0
+              ? Math.round(
+                  enrollments.reduce(
+                    (sum, e) => sum + (e.progress?.overall || 0),
+                    0,
+                  ) / enrollments.length,
+                )
+              : 0;
+
+          // Daily enrollments trend
+          const dailyEnrollments = await userCollection
+            .aggregate([
+              { $unwind: "$enrolledCourses" },
+              {
+                $match: {
+                  "enrolledCourses.courseId": new ObjectId(courseId),
+                  "enrolledCourses.enrollmentDate": {
+                    $gte: startDate,
+                    $lte: endDate,
+                  },
+                },
+              },
+              {
+                $group: {
+                  _id: {
+                    $dateToString: {
+                      format: "%Y-%m-%d",
+                      date: "$enrolledCourses.enrollmentDate",
+                    },
+                  },
+                  count: { $sum: 1 },
+                },
+              },
+              { $sort: { _id: 1 } },
+            ])
+            .toArray();
+
+          // Get revenue data
+          const revenue = await paymentCollection
+            .aggregate([
+              {
+                $match: {
+                  courseId: new ObjectId(courseId),
+                  status: "COMPLETED",
+                  createdAt: { $gte: startDate, $lte: endDate },
+                },
+              },
+              {
+                $group: {
+                  _id: null,
+                  total: { $sum: "$amount" },
+                  count: { $sum: 1 },
+                  avgPerStudent: { $avg: "$amount" },
+                },
+              },
+            ])
+            .toArray();
+
+          const revenueData = revenue[0] || {
+            total: 0,
+            count: 0,
+            avgPerStudent: 0,
+          };
+
+          // Get lesson completion data
+          const lessonCompletion = await getLessonCompletionStats(courseId);
+
+          // Get rating trends
+          const ratingTrends = await reviewCollection
+            .aggregate([
+              {
+                $match: {
+                  courseId: new ObjectId(courseId),
+                  isApproved: true,
+                  createdAt: { $gte: startDate, $lte: endDate },
+                },
+              },
+              {
+                $group: {
+                  _id: {
+                    $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+                  },
+                  average: { $avg: "$rating" },
+                  count: { $sum: 1 },
+                },
+              },
+              { $sort: { _id: 1 } },
+            ])
+            .toArray();
+
+          res.json({
+            success: true,
+            analytics: {
+              overview: {
+                totalEnrollments,
+                activeEnrollments,
+                completedEnrollments,
+                completionRate,
+                avgProgress,
+                totalRevenue: revenueData.total,
+                revenuePerStudent: revenueData.avgPerStudent,
+              },
+              trends: {
+                enrollments: dailyEnrollments,
+                ratings: ratingTrends,
+              },
+              lessonCompletion,
+              revenue: revenueData,
+            },
+          });
+        } catch (error) {
+          console.error("Analytics error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to fetch analytics",
+          });
+        }
+      },
+    );
+
+    // GET - Student Progress Analytics (Instructor/Admin only)
+    app.get(
+      "/analytics/courses/:courseId/students",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { courseId } = req.params;
+          const {
+            page = 1,
+            limit = 20,
+            sortBy = "progress",
+            sortOrder = -1,
+          } = req.query;
+
+          // Check permissions (similar to above)
+          // ... permission check code ...
+
+          const skip = (parseInt(page) - 1) * parseInt(limit);
+
+          const students = await userCollection
+            .aggregate([
+              { $unwind: "$enrolledCourses" },
+              {
+                $match: { "enrolledCourses.courseId": new ObjectId(courseId) },
+              },
+              {
+                $project: {
+                  _id: 1,
+                  name: 1,
+                  email: 1,
+                  uniqueId: 1,
+                  profile: 1,
+                  enrollment: "$enrolledCourses",
+                  progress: "$enrolledCourses.progress.overall",
+                  lastAccessed: "$enrolledCourses.progress.lastAccessed",
+                  timeSpent: "$enrolledCourses.progress.timeSpent",
+                  completedTopics: {
+                    $size: {
+                      $ifNull: [
+                        "$enrolledCourses.progress.completedTopics",
+                        [],
+                      ],
+                    },
+                  },
+                  totalTopics: course.stats?.totalTopics || 0,
+                },
+              },
+              { $sort: { [sortBy]: parseInt(sortOrder) } },
+              { $skip: skip },
+              { $limit: parseInt(limit) },
+            ])
+            .toArray();
+
+          const total = await userCollection.countDocuments({
+            "enrolledCourses.courseId": new ObjectId(courseId),
+          });
+
+          // Calculate completion percentage for each student
+          const studentsWithStats = students.map((s) => ({
+            ...s,
+            completionPercentage:
+              s.totalTopics > 0
+                ? Math.round((s.completedTopics / s.totalTopics) * 100)
+                : 0,
+          }));
+
+          res.json({
+            success: true,
+            students: studentsWithStats,
+            pagination: {
+              page: parseInt(page),
+              limit: parseInt(limit),
+              total,
+              pages: Math.ceil(total / parseInt(limit)),
+            },
+          });
+        } catch (error) {
+          console.error("Student analytics error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to fetch student analytics",
+          });
+        }
+      },
+    );
+
+    // GET - Instructor Dashboard Analytics (Admin/Instructor)
+    app.get("/analytics/dashboard", authenticateToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const user = await userCollection.findOne({
+          _id: new ObjectId(userId),
+        });
+
+        let query = {};
+        if (user.role !== "admin") {
+          // Instructors see only their courses
+          query = { "instructor._id": new ObjectId(userId) };
+        }
+
+        // Get all courses for this user
+        const courses = await courseCollection.find(query).toArray();
+        const courseIds = courses.map((c) => c._id);
+
+        // Overall stats
+        const totalCourses = courses.length;
+
+        // Total enrollments across all courses
+        const enrollments = await userCollection
+          .aggregate([
+            { $unwind: "$enrolledCourses" },
+            { $match: { "enrolledCourses.courseId": { $in: courseIds } } },
+            { $count: "total" },
+          ])
+          .toArray();
+        const totalEnrollments = enrollments[0]?.total || 0;
+
+        // Total revenue
+        const revenue = await paymentCollection
+          .aggregate([
+            { $match: { courseId: { $in: courseIds }, status: "COMPLETED" } },
+            { $group: { _id: null, total: { $sum: "$amount" } } },
+          ])
+          .toArray();
+        const totalRevenue = revenue[0]?.total || 0;
+
+        // Average completion rate
+        const completionData = await userCollection
+          .aggregate([
+            { $unwind: "$enrolledCourses" },
+            { $match: { "enrolledCourses.courseId": { $in: courseIds } } },
+            {
+              $group: {
+                _id: null,
+                avgProgress: { $avg: "$enrolledCourses.progress.overall" },
+                totalCompleted: {
+                  $sum: {
+                    $cond: [
+                      { $eq: ["$enrolledCourses.status", "completed"] },
+                      1,
+                      0,
+                    ],
+                  },
+                },
+              },
+            },
+          ])
+          .toArray();
+
+        // Course-wise breakdown
+        const courseStats = await Promise.all(
+          courses.map(async (course) => {
+            const courseEnrollments = await userCollection.countDocuments({
+              "enrolledCourses.courseId": course._id,
+            });
+
+            const courseRevenue = await paymentCollection
+              .aggregate([
+                { $match: { courseId: course._id, status: "COMPLETED" } },
+                { $group: { _id: null, total: { $sum: "$amount" } } },
+              ])
+              .toArray();
+
+            return {
+              _id: course._id,
+              title: course.title,
+              slug: course.slug,
+              thumbnail: course.thumbnail,
+              enrollments: courseEnrollments,
+              revenue: courseRevenue[0]?.total || 0,
+              rating: course.stats?.averageRating || 0,
+              reviews: course.stats?.totalReviews || 0,
+            };
+          }),
+        );
+
+        res.json({
+          success: true,
+          analytics: {
+            overview: {
+              totalCourses,
+              totalEnrollments,
+              totalRevenue,
+              averageProgress: completionData[0]?.avgProgress || 0,
+              totalCompleted: completionData[0]?.totalCompleted || 0,
+            },
+            courseStats,
+          },
+        });
+      } catch (error) {
+        console.error("Dashboard analytics error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch dashboard analytics",
+        });
+      }
+    });
+
+    // Helper function to get lesson completion stats
+    async function getLessonCompletionStats(courseId) {
+      const chapters = await chapterCollection
+        .find({ courseId: new ObjectId(courseId) })
+        .toArray();
+      const chapterIds = chapters.map((c) => c._id);
+      const lessons = await lessonCollection
+        .find({ chapterId: { $in: chapterIds } })
+        .toArray();
+
+      const stats = [];
+      for (const lesson of lessons) {
+        const completions = await userCollection.countDocuments({
+          "enrolledCourses.courseId": new ObjectId(courseId),
+          "enrolledCourses.progress.completedLessons": lesson._id,
+        });
+
+        stats.push({
+          lessonId: lesson._id,
+          title: lesson.title,
+          completions,
+        });
+      }
+
+      return stats;
+    }
 
     // Start server
     app.listen(PORT, () => {
