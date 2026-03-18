@@ -112,6 +112,17 @@ async function run() {
     const emailLogCollection = db.collection("emailLogs");
     const testimonialCollection = db.collection("testimonials");
     const contactCollection = db.collection("contacts");
+    const reviewCollection = db.collection("reviews");
+    // ============= ANALYTICS COLLECTIONS =============
+    const courseAnalyticsCollection = db.collection("courseAnalytics");
+    const userAnalyticsCollection = db.collection("userAnalytics");
+    const revenueAnalyticsCollection = db.collection("revenueAnalytics");
+
+    // Create indexes
+    await courseAnalyticsCollection.createIndex({ courseId: 1 });
+    await courseAnalyticsCollection.createIndex({ date: -1 });
+    await userAnalyticsCollection.createIndex({ userId: 1 });
+    await userAnalyticsCollection.createIndex({ courseId: 1, date: -1 });
 
     // Create indexes for better performance
     await courseCollection.createIndex({ slug: 1 }, { unique: true });
@@ -161,6 +172,15 @@ async function run() {
     // Create indexes for testimonials
     await testimonialCollection.createIndex({ status: 1, isApproved: 1 });
     await testimonialCollection.createIndex({ createdAt: -1 });
+
+    // Create indexes for review
+    await reviewCollection.createIndex(
+      { courseId: 1, userId: 1 },
+      { unique: true },
+    ); // One review per user per course
+    await reviewCollection.createIndex({ courseId: 1, createdAt: -1 });
+    await reviewCollection.createIndex({ rating: -1 });
+    await reviewCollection.createIndex({ isApproved: 1 });
 
     // Middleware to check if user is admin
     async function isAdmin(req, res, next) {
@@ -2138,17 +2158,53 @@ async function run() {
     });
 
     // GET all courses
+    // READ all courses with filters
     app.get("/courses", async (req, res) => {
       try {
+        const {
+          page = 1,
+          limit = 10,
+          category,
+          level,
+          status,
+          search,
+          sortBy = "createdAt",
+          sortOrder = -1,
+        } = req.query;
+
+        const query = {};
+
+        if (category) query.category = category;
+        if (level) query.level = level;
+        if (status) query.status = status;
+        if (search) {
+          query.$or = [
+            { title: { $regex: search, $options: "i" } },
+            { description: { $regex: search, $options: "i" } },
+            { tags: { $in: [new RegExp(search, "i")] } },
+          ];
+        }
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
         const courses = await courseCollection
-          .find({ status: "published" })
-          .sort({ createdAt: -1 })
+          .find(query)
+          .sort({ [sortBy]: parseInt(sortOrder) })
+          .skip(skip)
+          .limit(parseInt(limit))
           .toArray();
 
-        res.status(200).json({
+        const total = await courseCollection.countDocuments(query);
+
+        res.json({
           success: true,
-          count: courses.length,
           courses,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total,
+            pages: Math.ceil(total / parseInt(limit)),
+          },
         });
       } catch (error) {
         console.error("Get courses error:", error);
@@ -2160,12 +2216,19 @@ async function run() {
       }
     });
 
-    // GET single course by slug
-    app.get("/courses/:slug", async (req, res) => {
+    // READ single course by ID or slug
+    app.get("/courses/:identifier", async (req, res) => {
       try {
-        const course = await courseCollection.findOne({
-          slug: req.params.slug,
-        });
+        const { identifier } = req.params;
+
+        let query;
+        if (ObjectId.isValid(identifier)) {
+          query = { _id: new ObjectId(identifier) };
+        } else {
+          query = { slug: identifier };
+        }
+
+        const course = await courseCollection.findOne(query);
 
         if (!course) {
           return res.status(404).json({
@@ -2174,12 +2237,174 @@ async function run() {
           });
         }
 
-        res.status(200).json({
+        // Get chapters for this course
+        const chapters = await chapterCollection
+          .find({ courseId: course._id })
+          .sort({ order: 1 })
+          .toArray();
+
+        const chapterIds = chapters.map((ch) => ch._id);
+
+        // Get lessons
+        const lessons = await lessonCollection
+          .find({ chapterId: { $in: chapterIds } })
+          .sort({ order: 1 })
+          .toArray();
+
+        const lessonIds = lessons.map((l) => l._id);
+
+        // Get topics count
+        const topicsCount = await topicCollection.countDocuments({
+          lessonId: { $in: lessonIds },
+        });
+
+        // Get enrolled students count
+        const enrolledCount = await userCollection.countDocuments({
+          "enrolledCourses.courseId": course._id,
+        });
+
+        const completeCourse = {
+          ...course,
+          stats: {
+            ...course.stats,
+            totalChapters: chapters.length,
+            totalLessons: lessons.length,
+            totalTopics: topicsCount,
+            totalStudents: enrolledCount,
+          },
+          curriculum: chapters.map((chapter) => ({
+            ...chapter,
+            lessons: lessons.filter(
+              (l) => l.chapterId.toString() === chapter._id.toString(),
+            ),
+          })),
+        };
+
+        res.json({
           success: true,
-          course,
+          course: completeCourse,
         });
       } catch (error) {
         console.error("Get course error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch course",
+          error: error.message,
+        });
+      }
+    });
+
+    // GET course by slug with all data
+    app.get("/courses/:slug", async (req, res) => {
+      try {
+        const { slug } = req.params;
+
+        const db = client.db("lmsDB");
+        const courses = db.collection("courses");
+        const chapters = db.collection("chapters");
+        const lessons = db.collection("lessons");
+        const topics = db.collection("topics");
+        const users = db.collection("users");
+
+        // Find course
+        const course = await courses.findOne({ slug });
+
+        if (!course) {
+          return res.status(404).json({
+            success: false,
+            message: "Course not found",
+          });
+        }
+
+        // Get chapters for this course
+        const courseChapters = await chapters
+          .find({ courseId: course._id })
+          .sort({ order: 1 })
+          .toArray();
+
+        const chapterIds = courseChapters.map((ch) => ch._id);
+
+        // Get lessons for these chapters
+        const courseLessons = await lessons
+          .find({ chapterId: { $in: chapterIds } })
+          .sort({ order: 1 })
+          .toArray();
+
+        const lessonIds = courseLessons.map((l) => l._id);
+
+        // Get topics count
+        const topicsCount = await topics.countDocuments({
+          lessonId: { $in: lessonIds },
+        });
+
+        // Get instructor details
+        let instructorData = null;
+        if (course.instructor?._id) {
+          const instructor = await users.findOne(
+            { _id: course.instructor._id },
+            { projection: { password: 0, notifications: 0 } },
+          );
+          if (instructor) {
+            instructorData = {
+              ...instructor,
+              ...course.instructor, // Override with course-specific instructor data
+            };
+          }
+        }
+
+        // Build complete course data
+        const completeCourse = {
+          ...course,
+          stats: {
+            ...course.stats,
+            totalChapters: courseChapters.length,
+            totalLessons: courseLessons.length,
+            totalTopics: topicsCount,
+            totalStudents: course.stats?.totalStudents || 0,
+            averageRating: course.stats?.averageRating || 4.8,
+            totalReviews: course.stats?.totalReviews || 0,
+          },
+          curriculum: courseChapters.map((chapter) => ({
+            _id: chapter._id,
+            title: chapter.title,
+            description: chapter.description,
+            order: chapter.order,
+            lessonsCount: courseLessons.filter(
+              (l) => l.chapterId.toString() === chapter._id.toString(),
+            ).length,
+            duration: chapter.duration || "45 mins",
+            isFree: chapter.isFree || false,
+            lessons: courseLessons
+              .filter((l) => l.chapterId.toString() === chapter._id.toString())
+              .map((lesson) => ({
+                _id: lesson._id,
+                title: lesson.title,
+                duration: lesson.duration || "10 mins",
+                type: lesson.type || "video",
+              })),
+          })),
+          instructor: instructorData || course.instructor,
+          settings: {
+            hasCertificate: true,
+            hasLifetimeAccess: true,
+            hasMobileAccess: true,
+            hasSubtitles: true,
+            hasQuizzes: false,
+            hasAssignments: false,
+            hasProjects: true,
+            hasCommunity: true,
+            hasMentorship: false,
+            moneyBackGuarantee: 30,
+            ...course.settings,
+          },
+        };
+
+        res.status(200).json({
+          success: true,
+          course: completeCourse,
+        });
+      } catch (error) {
+        console.error("Error fetching course:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch course",
@@ -2226,37 +2451,54 @@ async function run() {
     });
 
     // POST create new course
-    app.post("/courses", async (req, res) => {
+    // CREATE course (Admin/Instructor only)
+    app.post("/courses", authenticateToken, async (req, res) => {
       try {
-        const { title, description, price, level, duration, thumbnail } =
-          req.body;
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
 
-        // Validate required fields
-        if (!title || !description || !price) {
-          return res.status(400).json({
+        if (user.role !== "admin" && user.role !== "instructor") {
+          return res.status(403).json({
             success: false,
-            message: "Title, description and price are required",
+            message:
+              "Unauthorized: Only admins and instructors can create courses",
           });
         }
 
-        // Generate unique slug
-        const slug = await createUniqueSlug(title, courseCollection);
-
         const courseData = {
-          title,
-          slug,
-          description,
-          price: parseFloat(price),
-          level: level || "beginner",
-          duration: duration || "12 weeks",
-          thumbnail: thumbnail || "https://via.placeholder.com/300x200",
-          totalChapters: 0,
-          totalLessons: 0,
-          totalTopics: 0,
-          status: "published",
+          ...req.body,
+          _id: new ObjectId(),
+          slug: generateSlug(req.body.title),
+          instructor: {
+            _id: user._id,
+            name: user.name,
+            avatar: user.profile?.photo || null,
+            title: user.profile?.title || "Instructor",
+          },
+          stats: {
+            totalChapters: 0,
+            totalLessons: 0,
+            totalTopics: 0,
+            totalStudents: 0,
+            averageRating: 0,
+            totalReviews: 0,
+            completionRate: 0,
+            lastUpdated: new Date(),
+            ...req.body.stats,
+          },
           createdAt: new Date(),
           updatedAt: new Date(),
+          status: req.body.status || "draft",
         };
+
+        // Check if slug already exists
+        const existingCourse = await courseCollection.findOne({
+          slug: courseData.slug,
+        });
+        if (existingCourse) {
+          courseData.slug = `${courseData.slug}-${Date.now()}`;
+        }
 
         const result = await courseCollection.insertOne(courseData);
 
@@ -2276,29 +2518,122 @@ async function run() {
     });
 
     // PUT update course
-    app.put("/courses/:id", async (req, res) => {
+    // app.put("/courses/:id", async (req, res) => {
+    //   try {
+    //     const { id } = req.params;
+    //     const {
+    //       title,
+    //       description,
+    //       price,
+    //       level,
+    //       duration,
+    //       thumbnail,
+    //       status,
+    //     } = req.body;
+
+    //     console.log("Updating course with identifier:", id);
+
+    //     // Find the course
+    //     let course;
+    //     if (ObjectId.isValid(id)) {
+    //       course = await courseCollection.findOne({ _id: new ObjectId(id) });
+    //     }
+    //     if (!course) {
+    //       course = await courseCollection.findOne({ slug: id });
+    //     }
+
+    //     if (!course) {
+    //       return res.status(404).json({
+    //         success: false,
+    //         message: "Course not found",
+    //       });
+    //     }
+
+    //     const updateData = {
+    //       ...(title && { title }),
+    //       ...(description && { description }),
+    //       ...(price && { price: parseFloat(price) }),
+    //       ...(level && { level }),
+    //       ...(duration && { duration }),
+    //       ...(thumbnail && { thumbnail }),
+    //       ...(status && { status }),
+    //       updatedAt: new Date(),
+    //     };
+
+    //     // Handle slug update only if title changed
+    //     if (title && title !== course.title) {
+    //       const newSlug = generateSlug(title);
+
+    //       // Check if slug exists for a DIFFERENT course
+    //       const existingCourse = await courseCollection.findOne({
+    //         slug: newSlug,
+    //         _id: { $ne: course._id },
+    //       });
+
+    //       if (existingCourse) {
+    //         // Make slug unique
+    //         let counter = 1;
+    //         let uniqueSlug = `${newSlug}-${counter}`;
+
+    //         while (
+    //           await courseCollection.findOne({
+    //             slug: uniqueSlug,
+    //             _id: { $ne: course._id },
+    //           })
+    //         ) {
+    //           counter++;
+    //           uniqueSlug = `${newSlug}-${counter}`;
+    //         }
+
+    //         updateData.slug = uniqueSlug;
+    //         console.log(`Generated unique slug: ${uniqueSlug}`);
+    //       } else {
+    //         updateData.slug = newSlug;
+    //         console.log(`Using new slug: ${newSlug}`);
+    //       }
+    //     }
+
+    //     const result = await courseCollection.updateOne(
+    //       { _id: course._id },
+    //       { $set: updateData },
+    //     );
+
+    //     console.log("Update result:", result);
+
+    //     res.status(200).json({
+    //       success: true,
+    //       message: "Course updated successfully",
+    //       slug: updateData.slug || course.slug, // Return the new slug if changed
+    //     });
+    //   } catch (error) {
+    //     console.error("Update course error:", error);
+    //     res.status(500).json({
+    //       success: false,
+    //       message: "Failed to update course",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
+
+    // UPDATE course (Admin/Instructor only)
+    app.patch("/courses/:id", authenticateToken, async (req, res) => {
       try {
         const { id } = req.params;
-        const {
-          title,
-          description,
-          price,
-          level,
-          duration,
-          thumbnail,
-          status,
-        } = req.body;
 
-        console.log("Updating course with identifier:", id);
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid course ID",
+          });
+        }
 
-        // Find the course
-        let course;
-        if (ObjectId.isValid(id)) {
-          course = await courseCollection.findOne({ _id: new ObjectId(id) });
-        }
-        if (!course) {
-          course = await courseCollection.findOne({ slug: id });
-        }
+        // Check permissions
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+        const course = await courseCollection.findOne({
+          _id: new ObjectId(id),
+        });
 
         if (!course) {
           return res.status(404).json({
@@ -2307,61 +2642,46 @@ async function run() {
           });
         }
 
+        // Only admin or the instructor who created the course can update
+        if (
+          user.role !== "admin" &&
+          course.instructor?._id?.toString() !== user._id.toString()
+        ) {
+          return res.status(403).json({
+            success: false,
+            message: "Unauthorized to update this course",
+          });
+        }
+
         const updateData = {
-          ...(title && { title }),
-          ...(description && { description }),
-          ...(price && { price: parseFloat(price) }),
-          ...(level && { level }),
-          ...(duration && { duration }),
-          ...(thumbnail && { thumbnail }),
-          ...(status && { status }),
+          ...req.body,
           updatedAt: new Date(),
         };
 
-        // Handle slug update only if title changed
-        if (title && title !== course.title) {
-          const newSlug = generateSlug(title);
+        // Update slug if title changed
+        if (req.body.title && req.body.title !== course.title) {
+          updateData.slug = generateSlug(req.body.title);
 
-          // Check if slug exists for a DIFFERENT course
+          // Check if new slug exists
           const existingCourse = await courseCollection.findOne({
-            slug: newSlug,
+            slug: updateData.slug,
             _id: { $ne: course._id },
           });
 
           if (existingCourse) {
-            // Make slug unique
-            let counter = 1;
-            let uniqueSlug = `${newSlug}-${counter}`;
-
-            while (
-              await courseCollection.findOne({
-                slug: uniqueSlug,
-                _id: { $ne: course._id },
-              })
-            ) {
-              counter++;
-              uniqueSlug = `${newSlug}-${counter}`;
-            }
-
-            updateData.slug = uniqueSlug;
-            console.log(`Generated unique slug: ${uniqueSlug}`);
-          } else {
-            updateData.slug = newSlug;
-            console.log(`Using new slug: ${newSlug}`);
+            updateData.slug = `${updateData.slug}-${Date.now()}`;
           }
         }
 
         const result = await courseCollection.updateOne(
-          { _id: course._id },
+          { _id: new ObjectId(id) },
           { $set: updateData },
         );
 
-        console.log("Update result:", result);
-
-        res.status(200).json({
+        res.json({
           success: true,
           message: "Course updated successfully",
-          slug: updateData.slug || course.slug, // Return the new slug if changed
+          modifiedCount: result.modifiedCount,
         });
       } catch (error) {
         console.error("Update course error:", error);
@@ -2372,40 +2692,313 @@ async function run() {
         });
       }
     });
+    // GET featured reviews
+    app.get("/courses/:courseId/reviews/featured", async (req, res) => {
+      try {
+        const { courseId } = req.params;
 
+        const db = client.db("lmsDB");
+        const reviews = db.collection("reviews");
+
+        const featuredReviews = await reviews
+          .find({
+            courseId: new ObjectId(courseId),
+            isFeatured: true,
+          })
+          .sort({ helpful: -1 })
+          .limit(3)
+          .toArray();
+
+        res.json({
+          success: true,
+          reviews: featuredReviews,
+        });
+      } catch (error) {
+        console.error("Error fetching reviews:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch reviews",
+        });
+      }
+    });
+
+    // GET related courses
+    app.get("/courses/:courseId/related", async (req, res) => {
+      try {
+        const { courseId } = req.params;
+
+        const db = client.db("lmsDB");
+        const courses = db.collection("courses");
+
+        const currentCourse = await courses.findOne({
+          _id: new ObjectId(courseId),
+        });
+
+        if (!currentCourse) {
+          return res.status(404).json({ message: "Course not found" });
+        }
+
+        const relatedCourses = await courses
+          .find({
+            _id: { $ne: currentCourse._id },
+            category: currentCourse.category,
+            status: "published",
+          })
+          .limit(3)
+          .project({
+            title: 1,
+            slug: 1,
+            thumbnail: 1,
+            level: 1,
+            "price.regular": 1,
+            "stats.averageRating": 1,
+            "stats.totalStudents": 1,
+          })
+          .toArray();
+
+        res.json({
+          success: true,
+          courses: relatedCourses,
+        });
+      } catch (error) {
+        console.error("Error fetching related courses:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch related courses",
+        });
+      }
+    });
     // DELETE course
-    app.delete("/courses/:id", async (req, res) => {
+    // DELETE course (Admin only)
+    app.delete("/courses/:id", authenticateToken, isAdmin, async (req, res) => {
       try {
         const { id } = req.params;
 
-        // Validate ID
         if (!ObjectId.isValid(id)) {
           return res.status(400).json({
             success: false,
-            message: "Invalid course ID format",
+            message: "Invalid course ID",
           });
         }
 
-        const result = await courseCollection.deleteOne({
-          _id: new ObjectId(id),
-        });
+        // Start a session for transaction
+        const session = client.startSession();
 
-        if (result.deletedCount === 0) {
-          return res.status(404).json({
-            success: false,
-            message: "Course not found",
+        try {
+          await session.withTransaction(async () => {
+            // Delete course
+            const courseResult = await courseCollection.deleteOne(
+              { _id: new ObjectId(id) },
+              { session },
+            );
+
+            if (courseResult.deletedCount === 0) {
+              throw new Error("Course not found");
+            }
+
+            // Delete all chapters
+            const chapters = await chapterCollection
+              .find({ courseId: new ObjectId(id) })
+              .toArray();
+
+            const chapterIds = chapters.map((ch) => ch._id);
+
+            if (chapterIds.length > 0) {
+              // Delete all lessons
+              const lessons = await lessonCollection
+                .find({ chapterId: { $in: chapterIds } })
+                .toArray();
+
+              const lessonIds = lessons.map((l) => l._id);
+
+              if (lessonIds.length > 0) {
+                // Delete all topics
+                await topicCollection.deleteMany(
+                  { lessonId: { $in: lessonIds } },
+                  { session },
+                );
+              }
+
+              // Delete all lessons
+              await lessonCollection.deleteMany(
+                { chapterId: { $in: chapterIds } },
+                { session },
+              );
+
+              // Delete all chapters
+              await chapterCollection.deleteMany(
+                { courseId: new ObjectId(id) },
+                { session },
+              );
+            }
+
+            // Remove course from users' enrolledCourses and wishlist
+            await userCollection.updateMany(
+              {},
+              {
+                $pull: {
+                  enrolledCourses: { courseId: new ObjectId(id) },
+                  wishlist: new ObjectId(id),
+                },
+              },
+              { session },
+            );
+
+            // Delete all certificates for this course
+            await certificateCollection.deleteMany(
+              { courseId: new ObjectId(id) },
+              { session },
+            );
+
+            // Delete all payments for this course
+            await paymentCollection.deleteMany(
+              { courseId: new ObjectId(id) },
+              { session },
+            );
           });
-        }
 
-        res.status(200).json({
-          success: true,
-          message: "Course deleted successfully",
-        });
+          await session.commitTransaction();
+
+          res.json({
+            success: true,
+            message: "Course and all related content deleted successfully",
+          });
+        } finally {
+          await session.endSession();
+        }
       } catch (error) {
         console.error("Delete course error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to delete course",
+          error: error.message,
+        });
+      }
+    });
+    // BULK operations on courses (Admin only)
+    app.post("/courses/bulk", authenticateToken, isAdmin, async (req, res) => {
+      try {
+        const { action, courseIds, data } = req.body;
+
+        if (!courseIds || !Array.isArray(courseIds) || courseIds.length === 0) {
+          return res.status(400).json({
+            success: false,
+            message: "No courses selected",
+          });
+        }
+
+        const objectIds = courseIds.map((id) => new ObjectId(id));
+        let result;
+
+        switch (action) {
+          case "publish":
+            result = await courseCollection.updateMany(
+              { _id: { $in: objectIds } },
+              {
+                $set: {
+                  status: "published",
+                  publishedAt: new Date(),
+                  updatedAt: new Date(),
+                },
+              },
+            );
+            break;
+
+          case "draft":
+            result = await courseCollection.updateMany(
+              { _id: { $in: objectIds } },
+              {
+                $set: {
+                  status: "draft",
+                  updatedAt: new Date(),
+                },
+              },
+            );
+            break;
+
+          case "archive":
+            result = await courseCollection.updateMany(
+              { _id: { $in: objectIds } },
+              {
+                $set: {
+                  status: "archived",
+                  updatedAt: new Date(),
+                },
+              },
+            );
+            break;
+
+          case "feature":
+            result = await courseCollection.updateMany(
+              { _id: { $in: objectIds } },
+              {
+                $addToSet: {
+                  badges: {
+                    type: "featured",
+                    text: "Featured",
+                    icon: "⭐",
+                    color: "amber",
+                  },
+                },
+                $set: { updatedAt: new Date() },
+              },
+            );
+            break;
+
+          case "unfeature":
+            result = await courseCollection.updateMany(
+              { _id: { $in: objectIds } },
+              {
+                $pull: { badges: { type: "featured" } },
+                $set: { updatedAt: new Date() },
+              },
+            );
+            break;
+
+          case "delete":
+            result = { deletedCount: 0 };
+            for (const id of objectIds) {
+              // Delete each course with its related content
+              await courseCollection.deleteOne({ _id: id });
+              result.deletedCount++;
+            }
+            break;
+
+          case "updateCategory":
+            if (!data?.category) {
+              return res.status(400).json({
+                success: false,
+                message: "Category is required",
+              });
+            }
+            result = await courseCollection.updateMany(
+              { _id: { $in: objectIds } },
+              {
+                $set: {
+                  category: data.category,
+                  updatedAt: new Date(),
+                },
+              },
+            );
+            break;
+
+          default:
+            return res.status(400).json({
+              success: false,
+              message: "Invalid action",
+            });
+        }
+
+        res.json({
+          success: true,
+          message: `Bulk action '${action}' completed successfully`,
+          modifiedCount: result.modifiedCount || result.deletedCount,
+        });
+      } catch (error) {
+        console.error("Bulk action error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to perform bulk action",
           error: error.message,
         });
       }
@@ -2493,27 +3086,19 @@ async function run() {
     });
 
     // POST create new chapter
-    app.post("/chapters", async (req, res) => {
+    // CREATE chapter
+    app.post("/chapters", authenticateToken, async (req, res) => {
       try {
         const { courseId, title, description, order } = req.body;
 
-        // Validate required fields
-        if (!courseId || !title) {
-          return res.status(400).json({
-            success: false,
-            message: "Course ID and title are required",
-          });
-        }
+        // Check permissions
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+        const course = await courseCollection.findOne({
+          _id: new ObjectId(courseId),
+        });
 
-        // Verify course exists
-        let courseQuery;
-        if (ObjectId.isValid(courseId)) {
-          courseQuery = { _id: new ObjectId(courseId) };
-        } else {
-          courseQuery = { _id: courseId };
-        }
-
-        const course = await db.collection("courses").findOne(courseQuery);
         if (!course) {
           return res.status(404).json({
             success: false,
@@ -2521,32 +3106,36 @@ async function run() {
           });
         }
 
-        // Get the highest order number for this course
-        const lastChapter = await db
-          .collection("chapters")
-          .find({ courseId: course._id })
-          .sort({ order: -1 })
-          .limit(1)
-          .toArray();
-
-        const nextOrder = lastChapter.length > 0 ? lastChapter[0].order + 1 : 1;
+        if (
+          user.role !== "admin" &&
+          course.instructor?._id?.toString() !== user._id.toString()
+        ) {
+          return res.status(403).json({
+            success: false,
+            message: "Unauthorized to add chapters to this course",
+          });
+        }
 
         const chapterData = {
-          courseId: course._id,
+          _id: new ObjectId(),
+          courseId: new ObjectId(courseId),
           title,
           description: description || "",
-          order: order || nextOrder,
-          totalLessons: 0,
+          order: order || 0,
+          lessonsCount: 0,
+          duration: "0 mins",
+          isFree: req.body.isFree || false,
           createdAt: new Date(),
           updatedAt: new Date(),
         };
 
-        const result = await db.collection("chapters").insertOne(chapterData);
+        const result = await chapterCollection.insertOne(chapterData);
 
-        // Update course's totalChapters count
-        await db
-          .collection("courses")
-          .updateOne({ _id: course._id }, { $inc: { totalChapters: 1 } });
+        // Update course totalChapters
+        await courseCollection.updateOne(
+          { _id: new ObjectId(courseId) },
+          { $inc: { "stats.totalChapters": 1 } },
+        );
 
         res.status(201).json({
           success: true,
@@ -2564,40 +3153,106 @@ async function run() {
     });
 
     // PUT update chapter
-    app.put("/chapters/:chapterId", async (req, res) => {
-      try {
-        const { chapterId } = req.params;
-        const { title, description, order } = req.body;
+    // app.put("/chapters/:chapterId", async (req, res) => {
+    //   try {
+    //     const { chapterId } = req.params;
+    //     const { title, description, order } = req.body;
 
-        // Validate ID
-        if (!ObjectId.isValid(chapterId)) {
+    //     // Validate ID
+    //     if (!ObjectId.isValid(chapterId)) {
+    //       return res.status(400).json({
+    //         success: false,
+    //         message: "Invalid chapter ID format",
+    //       });
+    //     }
+
+    //     const updateData = {
+    //       ...(title && { title }),
+    //       ...(description !== undefined && { description }),
+    //       ...(order && { order: parseInt(order) }),
+    //       updatedAt: new Date(),
+    //     };
+
+    //     const result = await db
+    //       .collection("chapters")
+    //       .updateOne({ _id: new ObjectId(chapterId) }, { $set: updateData });
+
+    //     if (result.matchedCount === 0) {
+    //       return res.status(404).json({
+    //         success: false,
+    //         message: "Chapter not found",
+    //       });
+    //     }
+
+    //     res.json({
+    //       success: true,
+    //       message: "Chapter updated successfully",
+    //     });
+    //   } catch (error) {
+    //     console.error("Update chapter error:", error);
+    //     res.status(500).json({
+    //       success: false,
+    //       message: "Failed to update chapter",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
+
+    // UPDATE chapter
+    app.patch("/chapters/:id", authenticateToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
           return res.status(400).json({
             success: false,
-            message: "Invalid chapter ID format",
+            message: "Invalid chapter ID",
           });
         }
 
-        const updateData = {
-          ...(title && { title }),
-          ...(description !== undefined && { description }),
-          ...(order && { order: parseInt(order) }),
-          updatedAt: new Date(),
-        };
+        const chapter = await chapterCollection.findOne({
+          _id: new ObjectId(id),
+        });
 
-        const result = await db
-          .collection("chapters")
-          .updateOne({ _id: new ObjectId(chapterId) }, { $set: updateData });
-
-        if (result.matchedCount === 0) {
+        if (!chapter) {
           return res.status(404).json({
             success: false,
             message: "Chapter not found",
           });
         }
 
+        // Check permissions
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+        const course = await courseCollection.findOne({
+          _id: chapter.courseId,
+        });
+
+        if (
+          user.role !== "admin" &&
+          course?.instructor?._id?.toString() !== user._id.toString()
+        ) {
+          return res.status(403).json({
+            success: false,
+            message: "Unauthorized to update this chapter",
+          });
+        }
+
+        const result = await chapterCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              ...req.body,
+              updatedAt: new Date(),
+            },
+          },
+        );
+
         res.json({
           success: true,
           message: "Chapter updated successfully",
+          modifiedCount: result.modifiedCount,
         });
       } catch (error) {
         console.error("Update chapter error:", error);
@@ -2610,21 +3265,83 @@ async function run() {
     });
 
     // DELETE chapter
-    app.delete("/chapters/:chapterId", async (req, res) => {
-      try {
-        const { chapterId } = req.params;
+    // app.delete("/chapters/:chapterId", async (req, res) => {
+    //   try {
+    //     const { chapterId } = req.params;
 
-        // Validate ID
-        if (!ObjectId.isValid(chapterId)) {
+    //     // Validate ID
+    //     if (!ObjectId.isValid(chapterId)) {
+    //       return res.status(400).json({
+    //         success: false,
+    //         message: "Invalid chapter ID format",
+    //       });
+    //     }
+
+    //     // Get chapter to find courseId
+    //     const chapter = await db.collection("chapters").findOne({
+    //       _id: new ObjectId(chapterId),
+    //     });
+
+    //     if (!chapter) {
+    //       return res.status(404).json({
+    //         success: false,
+    //         message: "Chapter not found",
+    //       });
+    //     }
+
+    //     // Delete all lessons and topics in this chapter first
+    //     const lessons = await db
+    //       .collection("lessons")
+    //       .find({ chapterId: chapter._id })
+    //       .toArray();
+
+    //     for (const lesson of lessons) {
+    //       await db.collection("topics").deleteMany({ lessonId: lesson._id });
+    //     }
+
+    //     await db.collection("lessons").deleteMany({ chapterId: chapter._id });
+
+    //     // Delete the chapter
+    //     const result = await db.collection("chapters").deleteOne({
+    //       _id: new ObjectId(chapterId),
+    //     });
+
+    //     // Update course's totalChapters count
+    //     await db
+    //       .collection("courses")
+    //       .updateOne(
+    //         { _id: chapter.courseId },
+    //         { $inc: { totalChapters: -1 } },
+    //       );
+
+    //     res.json({
+    //       success: true,
+    //       message: "Chapter and all its contents deleted successfully",
+    //     });
+    //   } catch (error) {
+    //     console.error("Delete chapter error:", error);
+    //     res.status(500).json({
+    //       success: false,
+    //       message: "Failed to delete chapter",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
+
+    // DELETE chapter
+    app.delete("/chapters/:id", authenticateToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
           return res.status(400).json({
             success: false,
-            message: "Invalid chapter ID format",
+            message: "Invalid chapter ID",
           });
         }
 
-        // Get chapter to find courseId
-        const chapter = await db.collection("chapters").findOne({
-          _id: new ObjectId(chapterId),
+        const chapter = await chapterCollection.findOne({
+          _id: new ObjectId(id),
         });
 
         if (!chapter) {
@@ -2634,34 +3351,52 @@ async function run() {
           });
         }
 
-        // Delete all lessons and topics in this chapter first
-        const lessons = await db
-          .collection("lessons")
+        // Check permissions
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+        const course = await courseCollection.findOne({
+          _id: chapter.courseId,
+        });
+
+        if (
+          user.role !== "admin" &&
+          course?.instructor?._id?.toString() !== user._id.toString()
+        ) {
+          return res.status(403).json({
+            success: false,
+            message: "Unauthorized to delete this chapter",
+          });
+        }
+
+        // Delete all lessons and topics in this chapter
+        const lessons = await lessonCollection
           .find({ chapterId: chapter._id })
           .toArray();
 
-        for (const lesson of lessons) {
-          await db.collection("topics").deleteMany({ lessonId: lesson._id });
+        const lessonIds = lessons.map((l) => l._id);
+
+        if (lessonIds.length > 0) {
+          await topicCollection.deleteMany({ lessonId: { $in: lessonIds } });
+          await lessonCollection.deleteMany({ chapterId: chapter._id });
         }
 
-        await db.collection("lessons").deleteMany({ chapterId: chapter._id });
+        await chapterCollection.deleteOne({ _id: chapter._id });
 
-        // Delete the chapter
-        const result = await db.collection("chapters").deleteOne({
-          _id: new ObjectId(chapterId),
-        });
-
-        // Update course's totalChapters count
-        await db
-          .collection("courses")
-          .updateOne(
-            { _id: chapter.courseId },
-            { $inc: { totalChapters: -1 } },
-          );
+        // Update course stats
+        await courseCollection.updateOne(
+          { _id: chapter.courseId },
+          {
+            $inc: {
+              "stats.totalChapters": -1,
+              "stats.totalLessons": -lessons.length,
+            },
+          },
+        );
 
         res.json({
           success: true,
-          message: "Chapter and all its contents deleted successfully",
+          message: "Chapter and all its content deleted successfully",
         });
       } catch (error) {
         console.error("Delete chapter error:", error);
@@ -2832,27 +3567,103 @@ async function run() {
     });
 
     // POST create new lesson (UPDATED WITH NOTIFICATION)
-    app.post("/lessons", async (req, res) => {
+    // app.post("/lessons", async (req, res) => {
+    //   try {
+    //     const { chapterId, title, description, order } = req.body;
+
+    //     // Validate required fields
+    //     if (!chapterId || !title) {
+    //       return res.status(400).json({
+    //         success: false,
+    //         message: "Chapter ID and title are required",
+    //       });
+    //     }
+
+    //     // Verify chapter exists
+    //     let chapterQuery;
+    //     if (ObjectId.isValid(chapterId)) {
+    //       chapterQuery = { _id: new ObjectId(chapterId) };
+    //     } else {
+    //       chapterQuery = { _id: chapterId };
+    //     }
+
+    //     const chapter = await db.collection("chapters").findOne(chapterQuery);
+    //     if (!chapter) {
+    //       return res.status(404).json({
+    //         success: false,
+    //         message: "Chapter not found",
+    //       });
+    //     }
+
+    //     // Get the highest order number for this chapter
+    //     const lastLesson = await db
+    //       .collection("lessons")
+    //       .find({ chapterId: chapter._id })
+    //       .sort({ order: -1 })
+    //       .limit(1)
+    //       .toArray();
+
+    //     const nextOrder = lastLesson.length > 0 ? lastLesson[0].order + 1 : 1;
+
+    //     const lessonData = {
+    //       chapterId: chapter._id,
+    //       title,
+    //       description: description || "",
+    //       order: order || nextOrder,
+    //       totalTopics: 0,
+    //       completed: false,
+    //       createdAt: new Date(),
+    //       updatedAt: new Date(),
+    //     };
+
+    //     const result = await db.collection("lessons").insertOne(lessonData);
+
+    //     // Update chapter's totalLessons count
+    //     await db
+    //       .collection("chapters")
+    //       .updateOne({ _id: chapter._id }, { $inc: { totalLessons: 1 } });
+
+    //     // Update course's totalLessons count
+    //     await db
+    //       .collection("courses")
+    //       .updateOne({ _id: chapter.courseId }, { $inc: { totalLessons: 1 } });
+
+    //     // ===== ADD NOTIFICATION TO ALL ENROLLED STUDENTS =====
+    //     const course = await courseCollection.findOne({
+    //       _id: chapter.courseId,
+    //     });
+    //     await notificationService.sendToCourseStudents(chapter.courseId, {
+    //       type: "course",
+    //       message: `📚 New lesson available: '${title}'`,
+    //       details: `Check out the new content in ${course.title}`,
+    //       actionUrl: `/course/${course.slug || chapter.courseId}`,
+    //     });
+
+    //     res.status(201).json({
+    //       success: true,
+    //       message: "Lesson created successfully",
+    //       lesson: { ...lessonData, _id: result.insertedId },
+    //     });
+    //   } catch (error) {
+    //     console.error("Create lesson error:", error);
+    //     res.status(500).json({
+    //       success: false,
+    //       message: "Failed to create lesson",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
+
+    // CREATE lesson
+    app.post("/lessons", authenticateToken, async (req, res) => {
       try {
-        const { chapterId, title, description, order } = req.body;
+        const { chapterId, title, description, type, duration, order } =
+          req.body;
 
-        // Validate required fields
-        if (!chapterId || !title) {
-          return res.status(400).json({
-            success: false,
-            message: "Chapter ID and title are required",
-          });
-        }
+        const chapter = await chapterCollection.findOne({
+          _id: new ObjectId(chapterId),
+        });
 
-        // Verify chapter exists
-        let chapterQuery;
-        if (ObjectId.isValid(chapterId)) {
-          chapterQuery = { _id: new ObjectId(chapterId) };
-        } else {
-          chapterQuery = { _id: chapterId };
-        }
-
-        const chapter = await db.collection("chapters").findOne(chapterQuery);
         if (!chapter) {
           return res.status(404).json({
             success: false,
@@ -2860,49 +3671,54 @@ async function run() {
           });
         }
 
-        // Get the highest order number for this chapter
-        const lastLesson = await db
-          .collection("lessons")
-          .find({ chapterId: chapter._id })
-          .sort({ order: -1 })
-          .limit(1)
-          .toArray();
+        // Check permissions
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+        const course = await courseCollection.findOne({
+          _id: chapter.courseId,
+        });
 
-        const nextOrder = lastLesson.length > 0 ? lastLesson[0].order + 1 : 1;
+        if (
+          user.role !== "admin" &&
+          course?.instructor?._id?.toString() !== user._id.toString()
+        ) {
+          return res.status(403).json({
+            success: false,
+            message: "Unauthorized to add lessons to this course",
+          });
+        }
 
         const lessonData = {
-          chapterId: chapter._id,
+          _id: new ObjectId(),
+          chapterId: new ObjectId(chapterId),
+          courseId: chapter.courseId,
           title,
           description: description || "",
-          order: order || nextOrder,
-          totalTopics: 0,
-          completed: false,
+          type: type || "video",
+          duration: duration || "0 mins",
+          order: order || 0,
+          topicsCount: 0,
+          isFree: req.body.isFree || false,
+          content: req.body.content || {},
+          resources: req.body.resources || [],
+          attachments: req.body.attachments || [],
           createdAt: new Date(),
           updatedAt: new Date(),
         };
 
-        const result = await db.collection("lessons").insertOne(lessonData);
+        const result = await lessonCollection.insertOne(lessonData);
 
-        // Update chapter's totalLessons count
-        await db
-          .collection("chapters")
-          .updateOne({ _id: chapter._id }, { $inc: { totalLessons: 1 } });
+        // Update chapter and course counts
+        await chapterCollection.updateOne(
+          { _id: chapter._id },
+          { $inc: { lessonsCount: 1 } },
+        );
 
-        // Update course's totalLessons count
-        await db
-          .collection("courses")
-          .updateOne({ _id: chapter.courseId }, { $inc: { totalLessons: 1 } });
-
-        // ===== ADD NOTIFICATION TO ALL ENROLLED STUDENTS =====
-        const course = await courseCollection.findOne({
-          _id: chapter.courseId,
-        });
-        await notificationService.sendToCourseStudents(chapter.courseId, {
-          type: "course",
-          message: `📚 New lesson available: '${title}'`,
-          details: `Check out the new content in ${course.title}`,
-          actionUrl: `/course/${course.slug || chapter.courseId}`,
-        });
+        await courseCollection.updateOne(
+          { _id: chapter.courseId },
+          { $inc: { "stats.totalLessons": 1 } },
+        );
 
         res.status(201).json({
           success: true,
@@ -2920,45 +3736,109 @@ async function run() {
     });
 
     // PUT update lesson
-    app.put("/lessons/:lessonId", async (req, res) => {
-      try {
-        const { lessonId } = req.params;
-        const { title, description, order } = req.body;
+    // app.put("/lessons/:lessonId", async (req, res) => {
+    //   try {
+    //     const { lessonId } = req.params;
+    //     const { title, description, order } = req.body;
 
-        // Validate ID
-        if (!ObjectId.isValid(lessonId)) {
+    //     // Validate ID
+    //     if (!ObjectId.isValid(lessonId)) {
+    //       return res.status(400).json({
+    //         success: false,
+    //         message: "Invalid lesson ID format",
+    //       });
+    //     }
+
+    //     // Get current lesson to find chapterId for later
+    //     const currentLesson = await db.collection("lessons").findOne({
+    //       _id: new ObjectId(lessonId),
+    //     });
+
+    //     if (!currentLesson) {
+    //       return res.status(404).json({
+    //         success: false,
+    //         message: "Lesson not found",
+    //       });
+    //     }
+
+    //     const updateData = {
+    //       ...(title && { title }),
+    //       ...(description !== undefined && { description }),
+    //       ...(order && { order: parseInt(order) }),
+    //       updatedAt: new Date(),
+    //     };
+
+    //     const result = await db
+    //       .collection("lessons")
+    //       .updateOne({ _id: new ObjectId(lessonId) }, { $set: updateData });
+
+    //     res.json({
+    //       success: true,
+    //       message: "Lesson updated successfully",
+    //     });
+    //   } catch (error) {
+    //     console.error("Update lesson error:", error);
+    //     res.status(500).json({
+    //       success: false,
+    //       message: "Failed to update lesson",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
+
+    // UPDATE lesson
+    app.patch("/lessons/:id", authenticateToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
           return res.status(400).json({
             success: false,
-            message: "Invalid lesson ID format",
+            message: "Invalid lesson ID",
           });
         }
 
-        // Get current lesson to find chapterId for later
-        const currentLesson = await db.collection("lessons").findOne({
-          _id: new ObjectId(lessonId),
+        const lesson = await lessonCollection.findOne({
+          _id: new ObjectId(id),
         });
 
-        if (!currentLesson) {
+        if (!lesson) {
           return res.status(404).json({
             success: false,
             message: "Lesson not found",
           });
         }
 
-        const updateData = {
-          ...(title && { title }),
-          ...(description !== undefined && { description }),
-          ...(order && { order: parseInt(order) }),
-          updatedAt: new Date(),
-        };
+        // Check permissions
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+        const course = await courseCollection.findOne({ _id: lesson.courseId });
 
-        const result = await db
-          .collection("lessons")
-          .updateOne({ _id: new ObjectId(lessonId) }, { $set: updateData });
+        if (
+          user.role !== "admin" &&
+          course?.instructor?._id?.toString() !== user._id.toString()
+        ) {
+          return res.status(403).json({
+            success: false,
+            message: "Unauthorized to update this lesson",
+          });
+        }
+
+        const result = await lessonCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              ...req.body,
+              updatedAt: new Date(),
+            },
+          },
+        );
 
         res.json({
           success: true,
           message: "Lesson updated successfully",
+          modifiedCount: result.modifiedCount,
         });
       } catch (error) {
         console.error("Update lesson error:", error);
@@ -2969,23 +3849,87 @@ async function run() {
         });
       }
     });
+    // DELETE lesson
+    // app.delete("/lessons/:lessonId", async (req, res) => {
+    //   try {
+    //     const { lessonId } = req.params;
+
+    //     // Validate ID
+    //     if (!ObjectId.isValid(lessonId)) {
+    //       return res.status(400).json({
+    //         success: false,
+    //         message: "Invalid lesson ID format",
+    //       });
+    //     }
+
+    //     // Get lesson to find chapterId
+    //     const lesson = await db.collection("lessons").findOne({
+    //       _id: new ObjectId(lessonId),
+    //     });
+
+    //     if (!lesson) {
+    //       return res.status(404).json({
+    //         success: false,
+    //         message: "Lesson not found",
+    //       });
+    //     }
+
+    //     // Get chapter to find courseId
+    //     const chapter = await db.collection("chapters").findOne({
+    //       _id: lesson.chapterId,
+    //     });
+
+    //     // Delete all topics in this lesson
+    //     await db.collection("topics").deleteMany({ lessonId: lesson._id });
+
+    //     // Delete the lesson
+    //     const result = await db.collection("lessons").deleteOne({
+    //       _id: new ObjectId(lessonId),
+    //     });
+
+    //     // Update chapter's totalLessons count
+    //     await db
+    //       .collection("chapters")
+    //       .updateOne({ _id: lesson.chapterId }, { $inc: { totalLessons: -1 } });
+
+    //     // Update course's totalLessons count
+    //     if (chapter) {
+    //       await db
+    //         .collection("courses")
+    //         .updateOne(
+    //           { _id: chapter.courseId },
+    //           { $inc: { totalLessons: -1 } },
+    //         );
+    //     }
+
+    //     res.json({
+    //       success: true,
+    //       message: "Lesson and all its topics deleted successfully",
+    //     });
+    //   } catch (error) {
+    //     console.error("Delete lesson error:", error);
+    //     res.status(500).json({
+    //       success: false,
+    //       message: "Failed to delete lesson",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
 
     // DELETE lesson
-    app.delete("/lessons/:lessonId", async (req, res) => {
+    app.delete("/lessons/:id", authenticateToken, async (req, res) => {
       try {
-        const { lessonId } = req.params;
+        const { id } = req.params;
 
-        // Validate ID
-        if (!ObjectId.isValid(lessonId)) {
+        if (!ObjectId.isValid(id)) {
           return res.status(400).json({
             success: false,
-            message: "Invalid lesson ID format",
+            message: "Invalid lesson ID",
           });
         }
 
-        // Get lesson to find chapterId
-        const lesson = await db.collection("lessons").findOne({
-          _id: new ObjectId(lessonId),
+        const lesson = await lessonCollection.findOne({
+          _id: new ObjectId(id),
         });
 
         if (!lesson) {
@@ -2995,33 +3939,45 @@ async function run() {
           });
         }
 
-        // Get chapter to find courseId
-        const chapter = await db.collection("chapters").findOne({
-          _id: lesson.chapterId,
+        // Check permissions
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
         });
+        const course = await courseCollection.findOne({ _id: lesson.courseId });
+
+        if (
+          user.role !== "admin" &&
+          course?.instructor?._id?.toString() !== user._id.toString()
+        ) {
+          return res.status(403).json({
+            success: false,
+            message: "Unauthorized to delete this lesson",
+          });
+        }
 
         // Delete all topics in this lesson
-        await db.collection("topics").deleteMany({ lessonId: lesson._id });
-
-        // Delete the lesson
-        const result = await db.collection("lessons").deleteOne({
-          _id: new ObjectId(lessonId),
+        const topicsCount = await topicCollection.countDocuments({
+          lessonId: lesson._id,
         });
+        await topicCollection.deleteMany({ lessonId: lesson._id });
 
-        // Update chapter's totalLessons count
-        await db
-          .collection("chapters")
-          .updateOne({ _id: lesson.chapterId }, { $inc: { totalLessons: -1 } });
+        await lessonCollection.deleteOne({ _id: lesson._id });
 
-        // Update course's totalLessons count
-        if (chapter) {
-          await db
-            .collection("courses")
-            .updateOne(
-              { _id: chapter.courseId },
-              { $inc: { totalLessons: -1 } },
-            );
-        }
+        // Update chapter and course counts
+        await chapterCollection.updateOne(
+          { _id: lesson.chapterId },
+          { $inc: { lessonsCount: -1 } },
+        );
+
+        await courseCollection.updateOne(
+          { _id: lesson.courseId },
+          {
+            $inc: {
+              "stats.totalLessons": -1,
+              "stats.totalTopics": -topicsCount,
+            },
+          },
+        );
 
         res.json({
           success: true,
@@ -3130,68 +4086,147 @@ async function run() {
     });
 
     // POST create new topic
-    app.post("/topics", async (req, res) => {
+    // app.post("/topics", async (req, res) => {
+    //   try {
+    //     const { lessonId, title, content, order } = req.body;
+
+    //     // Validate required fields
+    //     if (!lessonId || !title) {
+    //       return res.status(400).json({
+    //         success: false,
+    //         message: "Lesson ID and title are required",
+    //       });
+    //     }
+
+    //     // Verify lesson exists
+    //     if (!ObjectId.isValid(lessonId)) {
+    //       return res
+    //         .status(400)
+    //         .json({ success: false, message: "Invalid lesson ID format" });
+    //     }
+
+    //     const lesson = await db.collection("lessons").findOne({
+    //       _id: new ObjectId(lessonId),
+    //     });
+
+    //     if (!lesson) {
+    //       return res
+    //         .status(404)
+    //         .json({ success: false, message: "Lesson not found" });
+    //     }
+
+    //     // Get the highest order number for this lesson
+    //     const lastTopic = await db
+    //       .collection("topics")
+    //       .find({ lessonId: new ObjectId(lessonId) })
+    //       .sort({ order: -1 })
+    //       .limit(1)
+    //       .toArray();
+
+    //     const nextOrder = lastTopic.length > 0 ? lastTopic[0].order + 1 : 1;
+
+    //     const topicData = {
+    //       lessonId: new ObjectId(lessonId),
+    //       title,
+    //       content: content || {
+    //         description: "",
+    //         contentBlocks: [],
+    //         duration: "",
+    //         readingTime: "",
+    //       },
+    //       order: order || nextOrder,
+    //       createdAt: new Date(),
+    //       updatedAt: new Date(),
+    //     };
+
+    //     const result = await db.collection("topics").insertOne(topicData);
+
+    //     // Update lesson's totalTopics count
+    //     await db
+    //       .collection("lessons")
+    //       .updateOne(
+    //         { _id: new ObjectId(lessonId) },
+    //         { $inc: { totalTopics: 1 } },
+    //       );
+
+    //     res.status(201).json({
+    //       success: true,
+    //       message: "Topic created successfully",
+    //       topic: { ...topicData, _id: result.insertedId },
+    //     });
+    //   } catch (error) {
+    //     console.error("Create topic error:", error);
+    //     res.status(500).json({
+    //       success: false,
+    //       message: "Failed to create topic",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
+
+    // PUT update topic
+
+    // CREATE topic
+    app.post("/topics", authenticateToken, async (req, res) => {
       try {
-        const { lessonId, title, content, order } = req.body;
+        const { lessonId, title, content, type, duration, order } = req.body;
 
-        // Validate required fields
-        if (!lessonId || !title) {
-          return res.status(400).json({
-            success: false,
-            message: "Lesson ID and title are required",
-          });
-        }
-
-        // Verify lesson exists
-        if (!ObjectId.isValid(lessonId)) {
-          return res
-            .status(400)
-            .json({ success: false, message: "Invalid lesson ID format" });
-        }
-
-        const lesson = await db.collection("lessons").findOne({
+        const lesson = await lessonCollection.findOne({
           _id: new ObjectId(lessonId),
         });
 
         if (!lesson) {
-          return res
-            .status(404)
-            .json({ success: false, message: "Lesson not found" });
+          return res.status(404).json({
+            success: false,
+            message: "Lesson not found",
+          });
         }
 
-        // Get the highest order number for this lesson
-        const lastTopic = await db
-          .collection("topics")
-          .find({ lessonId: new ObjectId(lessonId) })
-          .sort({ order: -1 })
-          .limit(1)
-          .toArray();
+        // Check permissions
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+        const course = await courseCollection.findOne({ _id: lesson.courseId });
 
-        const nextOrder = lastTopic.length > 0 ? lastTopic[0].order + 1 : 1;
+        if (
+          user.role !== "admin" &&
+          course?.instructor?._id?.toString() !== user._id.toString()
+        ) {
+          return res.status(403).json({
+            success: false,
+            message: "Unauthorized to add topics to this course",
+          });
+        }
 
         const topicData = {
+          _id: new ObjectId(),
           lessonId: new ObjectId(lessonId),
+          chapterId: lesson.chapterId,
+          courseId: lesson.courseId,
           title,
-          content: content || {
-            description: "",
-            contentBlocks: [],
-            duration: "",
-            readingTime: "",
-          },
-          order: order || nextOrder,
+          content: content || {},
+          type: type || "reading",
+          duration: duration || "5 mins",
+          order: order || 0,
+          codeSnippets: req.body.codeSnippets || [],
+          images: req.body.images || [],
+          downloads: req.body.downloads || [],
           createdAt: new Date(),
           updatedAt: new Date(),
         };
 
-        const result = await db.collection("topics").insertOne(topicData);
+        const result = await topicCollection.insertOne(topicData);
 
-        // Update lesson's totalTopics count
-        await db
-          .collection("lessons")
-          .updateOne(
-            { _id: new ObjectId(lessonId) },
-            { $inc: { totalTopics: 1 } },
-          );
+        // Update lesson and course counts
+        await lessonCollection.updateOne(
+          { _id: lesson._id },
+          { $inc: { topicsCount: 1 } },
+        );
+
+        await courseCollection.updateOne(
+          { _id: lesson.courseId },
+          { $inc: { "stats.totalTopics": 1 } },
+        );
 
         res.status(201).json({
           success: true,
@@ -3208,39 +4243,102 @@ async function run() {
       }
     });
 
-    // PUT update topic
-    app.put("/topics/:topicId", async (req, res) => {
+    // app.put("/topics/:topicId", async (req, res) => {
+    //   try {
+    //     const { topicId } = req.params;
+    //     const { title, content, order } = req.body;
+
+    //     // Validate ID
+    //     if (!ObjectId.isValid(topicId)) {
+    //       return res
+    //         .status(400)
+    //         .json({ success: false, message: "Invalid topic ID format" });
+    //     }
+
+    //     const updateData = {
+    //       ...(title && { title }),
+    //       ...(content && { content }),
+    //       ...(order && { order: parseInt(order) }),
+    //       updatedAt: new Date(),
+    //     };
+
+    //     const result = await db
+    //       .collection("topics")
+    //       .updateOne({ _id: new ObjectId(topicId) }, { $set: updateData });
+
+    //     if (result.matchedCount === 0) {
+    //       return res
+    //         .status(404)
+    //         .json({ success: false, message: "Topic not found" });
+    //     }
+
+    //     res.json({
+    //       success: true,
+    //       message: "Topic updated successfully",
+    //     });
+    //   } catch (error) {
+    //     console.error("Update topic error:", error);
+    //     res.status(500).json({
+    //       success: false,
+    //       message: "Failed to update topic",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
+
+    // DELETE topic
+
+    // UPDATE topic
+    app.patch("/topics/:id", authenticateToken, async (req, res) => {
       try {
-        const { topicId } = req.params;
-        const { title, content, order } = req.body;
+        const { id } = req.params;
 
-        // Validate ID
-        if (!ObjectId.isValid(topicId)) {
-          return res
-            .status(400)
-            .json({ success: false, message: "Invalid topic ID format" });
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid topic ID",
+          });
         }
 
-        const updateData = {
-          ...(title && { title }),
-          ...(content && { content }),
-          ...(order && { order: parseInt(order) }),
-          updatedAt: new Date(),
-        };
+        const topic = await topicCollection.findOne({ _id: new ObjectId(id) });
 
-        const result = await db
-          .collection("topics")
-          .updateOne({ _id: new ObjectId(topicId) }, { $set: updateData });
-
-        if (result.matchedCount === 0) {
-          return res
-            .status(404)
-            .json({ success: false, message: "Topic not found" });
+        if (!topic) {
+          return res.status(404).json({
+            success: false,
+            message: "Topic not found",
+          });
         }
+
+        // Check permissions
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+        const course = await courseCollection.findOne({ _id: topic.courseId });
+
+        if (
+          user.role !== "admin" &&
+          course?.instructor?._id?.toString() !== user._id.toString()
+        ) {
+          return res.status(403).json({
+            success: false,
+            message: "Unauthorized to update this topic",
+          });
+        }
+
+        const result = await topicCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              ...req.body,
+              updatedAt: new Date(),
+            },
+          },
+        );
 
         res.json({
           success: true,
           message: "Topic updated successfully",
+          modifiedCount: result.modifiedCount,
         });
       } catch (error) {
         console.error("Update topic error:", error);
@@ -3252,38 +4350,103 @@ async function run() {
       }
     });
 
-    // DELETE topic
-    app.delete("/topics/:topicId", async (req, res) => {
-      try {
-        const { topicId } = req.params;
+    // app.delete("/topics/:topicId", async (req, res) => {
+    //   try {
+    //     const { topicId } = req.params;
 
-        // Validate ID
-        if (!ObjectId.isValid(topicId)) {
-          return res
-            .status(400)
-            .json({ success: false, message: "Invalid topic ID format" });
+    //     // Validate ID
+    //     if (!ObjectId.isValid(topicId)) {
+    //       return res
+    //         .status(400)
+    //         .json({ success: false, message: "Invalid topic ID format" });
+    //     }
+
+    //     // Get topic to find lessonId
+    //     const topic = await db.collection("topics").findOne({
+    //       _id: new ObjectId(topicId),
+    //     });
+
+    //     if (!topic) {
+    //       return res
+    //         .status(404)
+    //         .json({ success: false, message: "Topic not found" });
+    //     }
+
+    //     // Delete the topic
+    //     const result = await db.collection("topics").deleteOne({
+    //       _id: new ObjectId(topicId),
+    //     });
+
+    //     // Update lesson's totalTopics count
+    //     await db
+    //       .collection("lessons")
+    //       .updateOne({ _id: topic.lessonId }, { $inc: { totalTopics: -1 } });
+
+    //     res.json({
+    //       success: true,
+    //       message: "Topic deleted successfully",
+    //     });
+    //   } catch (error) {
+    //     console.error("Delete topic error:", error);
+    //     res.status(500).json({
+    //       success: false,
+    //       message: "Failed to delete topic",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
+
+    // POST reorder topics
+
+    // DELETE topic
+    app.delete("/topics/:id", authenticateToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid topic ID",
+          });
         }
 
-        // Get topic to find lessonId
-        const topic = await db.collection("topics").findOne({
-          _id: new ObjectId(topicId),
-        });
+        const topic = await topicCollection.findOne({ _id: new ObjectId(id) });
 
         if (!topic) {
-          return res
-            .status(404)
-            .json({ success: false, message: "Topic not found" });
+          return res.status(404).json({
+            success: false,
+            message: "Topic not found",
+          });
         }
 
-        // Delete the topic
-        const result = await db.collection("topics").deleteOne({
-          _id: new ObjectId(topicId),
+        // Check permissions
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
         });
+        const course = await courseCollection.findOne({ _id: topic.courseId });
 
-        // Update lesson's totalTopics count
-        await db
-          .collection("lessons")
-          .updateOne({ _id: topic.lessonId }, { $inc: { totalTopics: -1 } });
+        if (
+          user.role !== "admin" &&
+          course?.instructor?._id?.toString() !== user._id.toString()
+        ) {
+          return res.status(403).json({
+            success: false,
+            message: "Unauthorized to delete this topic",
+          });
+        }
+
+        await topicCollection.deleteOne({ _id: topic._id });
+
+        // Update lesson and course counts
+        await lessonCollection.updateOne(
+          { _id: topic.lessonId },
+          { $inc: { topicsCount: -1 } },
+        );
+
+        await courseCollection.updateOne(
+          { _id: topic.courseId },
+          { $inc: { "stats.totalTopics": -1 } },
+        );
 
         res.json({
           success: true,
@@ -3299,7 +4462,6 @@ async function run() {
       }
     });
 
-    // POST reorder topics
     app.post("/topics/reorder", async (req, res) => {
       try {
         const { topics } = req.body;
@@ -3401,34 +4563,27 @@ async function run() {
       },
     );
 
-    // Get enrolled students count for a course
+    // GET enrolled students count
     app.get("/courses/:courseId/enrolled-count", async (req, res) => {
       try {
         const { courseId } = req.params;
 
-        // Validate courseId
-        if (!ObjectId.isValid(courseId)) {
-          return res.status(400).json({
-            success: false,
-            message: "Invalid course ID format",
-          });
-        }
+        const db = client.db("lmsDB");
+        const users = db.collection("users");
 
-        // Count users who have this course in their enrolledCourses
-        const count = await db.collection("users").countDocuments({
+        const count = await users.countDocuments({
           "enrolledCourses.courseId": new ObjectId(courseId),
         });
 
         res.json({
           success: true,
-          count: count,
+          count,
         });
       } catch (error) {
-        console.error("Get enrolled count error:", error);
+        console.error("Error fetching enrolled count:", error);
         res.status(500).json({
           success: false,
-          message: "Failed to get enrolled count",
-          error: error.message,
+          message: "Failed to fetch enrolled count",
         });
       }
     });
@@ -5373,6 +6528,703 @@ Course: ${course?.title || "N/A"}
         }
       },
     );
+
+    // ============= REVIEW API ROUTES =============
+
+    // POST - Create a new review (Authenticated users only)
+    app.post(
+      "/courses/:courseId/reviews",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { courseId } = req.params;
+          const userId = req.user.userId;
+          const { rating, comment, title } = req.body;
+
+          // Validate input
+          if (!rating || rating < 1 || rating > 5) {
+            return res.status(400).json({
+              success: false,
+              message: "Rating must be between 1 and 5",
+            });
+          }
+
+          if (!comment || comment.trim().length < 10) {
+            return res.status(400).json({
+              success: false,
+              message: "Review comment must be at least 10 characters",
+            });
+          }
+
+          // Check if user is enrolled in the course
+          const user = await userCollection.findOne({
+            _id: new ObjectId(userId),
+            "enrolledCourses.courseId": new ObjectId(courseId),
+          });
+
+          if (!user) {
+            return res.status(403).json({
+              success: false,
+              message: "You must be enrolled in this course to leave a review",
+            });
+          }
+
+          // Check if user already reviewed this course
+          const existingReview = await reviewCollection.findOne({
+            courseId: new ObjectId(courseId),
+            userId: new ObjectId(userId),
+          });
+
+          if (existingReview) {
+            return res.status(400).json({
+              success: false,
+              message: "You have already reviewed this course",
+            });
+          }
+
+          // Create review
+          const review = {
+            _id: new ObjectId(),
+            courseId: new ObjectId(courseId),
+            userId: new ObjectId(userId),
+            userName: user.name,
+            userAvatar: user.profile?.photo || null,
+            rating: parseInt(rating),
+            title: title || "",
+            comment: comment.trim(),
+            isApproved: false, // Requires admin approval
+            isFeatured: false,
+            helpful: 0,
+            reported: false,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+
+          await reviewCollection.insertOne(review);
+
+          // Update course rating stats
+          await updateCourseRatingStats(courseId);
+
+          res.status(201).json({
+            success: true,
+            message:
+              "Review submitted successfully! It will be visible after approval.",
+            review,
+          });
+        } catch (error) {
+          console.error("Create review error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to submit review",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // GET - Get all reviews for a course (Public)
+    app.get("/courses/:courseId/reviews", async (req, res) => {
+      try {
+        const { courseId } = req.params;
+        const { page = 1, limit = 10, sort = "recent" } = req.query;
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        let sortOptions = { createdAt: -1 };
+        if (sort === "highest") sortOptions = { rating: -1, createdAt: -1 };
+        if (sort === "lowest") sortOptions = { rating: 1, createdAt: -1 };
+        if (sort === "helpful") sortOptions = { helpful: -1, createdAt: -1 };
+
+        const reviews = await reviewCollection
+          .find({
+            courseId: new ObjectId(courseId),
+            isApproved: true, // Only show approved reviews
+          })
+          .sort(sortOptions)
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        const total = await reviewCollection.countDocuments({
+          courseId: new ObjectId(courseId),
+          isApproved: true,
+        });
+
+        // Get rating distribution
+        const distribution = await reviewCollection
+          .aggregate([
+            { $match: { courseId: new ObjectId(courseId), isApproved: true } },
+            { $group: { _id: "$rating", count: { $sum: 1 } } },
+            { $sort: { _id: -1 } },
+          ])
+          .toArray();
+
+        const ratingCounts = {
+          5: 0,
+          4: 0,
+          3: 0,
+          2: 0,
+          1: 0,
+        };
+
+        distribution.forEach((item) => {
+          ratingCounts[item._id] = item.count;
+        });
+
+        res.json({
+          success: true,
+          reviews,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total,
+            pages: Math.ceil(total / parseInt(limit)),
+          },
+          distribution: ratingCounts,
+        });
+      } catch (error) {
+        console.error("Get reviews error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch reviews",
+        });
+      }
+    });
+
+    // GET - Check if user can review (Authenticated)
+    app.get(
+      "/courses/:courseId/can-review",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { courseId } = req.params;
+          const userId = req.user.userId;
+
+          // Check if enrolled
+          const user = await userCollection.findOne({
+            _id: new ObjectId(userId),
+            "enrolledCourses.courseId": new ObjectId(courseId),
+          });
+
+          if (!user) {
+            return res.json({
+              success: true,
+              canReview: false,
+              reason: "not_enrolled",
+            });
+          }
+
+          // Check if already reviewed
+          const existingReview = await reviewCollection.findOne({
+            courseId: new ObjectId(courseId),
+            userId: new ObjectId(userId),
+          });
+
+          if (existingReview) {
+            return res.json({
+              success: true,
+              canReview: false,
+              reason: "already_reviewed",
+              review: existingReview,
+            });
+          }
+
+          res.json({
+            success: true,
+            canReview: true,
+          });
+        } catch (error) {
+          console.error("Check review status error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to check review status",
+          });
+        }
+      },
+    );
+
+    // PATCH - Update review (Authenticated - own review only)
+    app.patch("/reviews/:reviewId", authenticateToken, async (req, res) => {
+      try {
+        const { reviewId } = req.params;
+        const userId = req.user.userId;
+        const { rating, comment, title } = req.body;
+
+        const review = await reviewCollection.findOne({
+          _id: new ObjectId(reviewId),
+          userId: new ObjectId(userId),
+        });
+
+        if (!review) {
+          return res.status(404).json({
+            success: false,
+            message: "Review not found or unauthorized",
+          });
+        }
+
+        const updateData = {
+          ...(rating && { rating: parseInt(rating) }),
+          ...(comment && { comment: comment.trim() }),
+          ...(title && { title }),
+          updatedAt: new Date(),
+          isApproved: false, // Requires re-approval after edit
+        };
+
+        await reviewCollection.updateOne(
+          { _id: new ObjectId(reviewId) },
+          { $set: updateData },
+        );
+
+        // Update course rating stats
+        await updateCourseRatingStats(review.courseId);
+
+        res.json({
+          success: true,
+          message: "Review updated successfully",
+        });
+      } catch (error) {
+        console.error("Update review error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to update review",
+        });
+      }
+    });
+
+    // DELETE - Delete review (Authenticated - own review only or Admin)
+    app.delete("/reviews/:reviewId", authenticateToken, async (req, res) => {
+      try {
+        const { reviewId } = req.params;
+        const userId = req.user.userId;
+        const user = await userCollection.findOne({
+          _id: new ObjectId(userId),
+        });
+
+        const query = { _id: new ObjectId(reviewId) };
+        if (user.role !== "admin") {
+          query.userId = new ObjectId(userId); // Non-admins can only delete their own
+        }
+
+        const review = await reviewCollection.findOne(query);
+
+        if (!review) {
+          return res.status(404).json({
+            success: false,
+            message: "Review not found or unauthorized",
+          });
+        }
+
+        await reviewCollection.deleteOne({ _id: review._id });
+
+        // Update course rating stats
+        await updateCourseRatingStats(review.courseId);
+
+        res.json({
+          success: true,
+          message: "Review deleted successfully",
+        });
+      } catch (error) {
+        console.error("Delete review error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to delete review",
+        });
+      }
+    });
+
+    // POST - Mark review as helpful
+    app.post(
+      "/reviews/:reviewId/helpful",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { reviewId } = req.params;
+
+          await reviewCollection.updateOne(
+            { _id: new ObjectId(reviewId) },
+            { $inc: { helpful: 1 } },
+          );
+
+          res.json({
+            success: true,
+            message: "Thank you for your feedback",
+          });
+        } catch (error) {
+          console.error("Helpful mark error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to mark as helpful",
+          });
+        }
+      },
+    );
+
+    // Helper function to update course rating stats
+    async function updateCourseRatingStats(courseId) {
+      try {
+        const stats = await reviewCollection
+          .aggregate([
+            { $match: { courseId: new ObjectId(courseId), isApproved: true } },
+            {
+              $group: {
+                _id: null,
+                averageRating: { $avg: "$rating" },
+                totalReviews: { $sum: 1 },
+                distribution: {
+                  $push: "$rating",
+                },
+              },
+            },
+          ])
+          .toArray();
+
+        if (stats.length > 0) {
+          const distribution = {
+            5: 0,
+            4: 0,
+            3: 0,
+            2: 0,
+            1: 0,
+          };
+
+          // Calculate distribution
+          const allReviews = await reviewCollection
+            .find({
+              courseId: new ObjectId(courseId),
+              isApproved: true,
+            })
+            .toArray();
+
+          allReviews.forEach((review) => {
+            distribution[review.rating]++;
+          });
+
+          await courseCollection.updateOne(
+            { _id: new ObjectId(courseId) },
+            {
+              $set: {
+                "stats.averageRating": parseFloat(
+                  stats[0].averageRating.toFixed(1),
+                ),
+                "stats.totalReviews": stats[0].totalReviews,
+                "reviews.distribution": distribution,
+              },
+            },
+          );
+        } else {
+          // No reviews
+          await courseCollection.updateOne(
+            { _id: new ObjectId(courseId) },
+            {
+              $set: {
+                "stats.averageRating": 0,
+                "stats.totalReviews": 0,
+                "reviews.distribution": { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 },
+              },
+            },
+          );
+        }
+      } catch (error) {
+        console.error("Update course rating stats error:", error);
+      }
+    }
+
+    // ============= ADMIN REVIEW MANAGEMENT =============
+
+    // GET - Get all reviews with filters (Admin only)
+    app.get("/admin/reviews", authenticateToken, isAdmin, async (req, res) => {
+      try {
+        const {
+          page = 1,
+          limit = 10,
+          status = "pending", // pending, approved, rejected
+          courseId,
+          search,
+        } = req.query;
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        let query = {};
+
+        // Filter by approval status
+        if (status === "pending") {
+          query.isApproved = false;
+          query.isRejected = { $ne: true };
+        } else if (status === "approved") {
+          query.isApproved = true;
+        } else if (status === "rejected") {
+          query.isRejected = true;
+        }
+
+        // Filter by course
+        if (courseId && ObjectId.isValid(courseId)) {
+          query.courseId = new ObjectId(courseId);
+        }
+
+        // Search by user name or comment
+        if (search) {
+          query.$or = [
+            { userName: { $regex: search, $options: "i" } },
+            { comment: { $regex: search, $options: "i" } },
+            { title: { $regex: search, $options: "i" } },
+          ];
+        }
+
+        const reviews = await reviewCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .toArray();
+
+        const total = await reviewCollection.countDocuments(query);
+
+        // Get course details for each review
+        const reviewsWithCourse = await Promise.all(
+          reviews.map(async (review) => {
+            const course = await courseCollection.findOne(
+              { _id: review.courseId },
+              { projection: { title: 1, thumbnail: 1, slug: 1 } },
+            );
+            return {
+              ...review,
+              course,
+            };
+          }),
+        );
+
+        res.json({
+          success: true,
+          reviews: reviewsWithCourse,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total,
+            pages: Math.ceil(total / parseInt(limit)),
+          },
+        });
+      } catch (error) {
+        console.error("Get admin reviews error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch reviews",
+        });
+      }
+    });
+
+    // PATCH - Approve review (Admin/Instructor)
+    app.patch(
+      "/admin/reviews/:reviewId/approve",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { reviewId } = req.params;
+          const { featured } = req.body;
+
+          // Check if user is admin or instructor
+          const user = await userCollection.findOne({
+            _id: new ObjectId(req.user.userId),
+          });
+          if (user.role !== "admin" && user.role !== "instructor") {
+            return res.status(403).json({
+              success: false,
+              message:
+                "Unauthorized: Only admins and instructors can approve reviews",
+            });
+          }
+
+          const updateData = {
+            isApproved: true,
+            isRejected: false,
+            approvedAt: new Date(),
+            approvedBy: new ObjectId(req.user.userId),
+            ...(featured !== undefined && { isFeatured: featured }),
+          };
+
+          const review = await reviewCollection.findOneAndUpdate(
+            { _id: new ObjectId(reviewId) },
+            { $set: updateData },
+            { returnDocument: "after" },
+          );
+
+          if (!review) {
+            return res.status(404).json({
+              success: false,
+              message: "Review not found",
+            });
+          }
+
+          // Update course rating stats
+          await updateCourseRatingStats(review.courseId);
+
+          // Send notification to user
+          await notificationService.sendToUser(review.userId, {
+            type: "review",
+            message: "Your review has been approved and is now public!",
+            details: `Your review for the course has been approved. Thank you for your feedback!`,
+            actionUrl: `/courses/${review.courseId}`,
+          });
+
+          res.json({
+            success: true,
+            message: "Review approved successfully",
+            review,
+          });
+        } catch (error) {
+          console.error("Approve review error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to approve review",
+          });
+        }
+      },
+    );
+
+    // PATCH - Reject review (Admin/Instructor)
+    app.patch(
+      "/admin/reviews/:reviewId/reject",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { reviewId } = req.params;
+          const { reason } = req.body;
+
+          // Check if user is admin or instructor
+          const user = await userCollection.findOne({
+            _id: new ObjectId(req.user.userId),
+          });
+          if (user.role !== "admin" && user.role !== "instructor") {
+            return res.status(403).json({
+              success: false,
+              message:
+                "Unauthorized: Only admins and instructors can reject reviews",
+            });
+          }
+
+          const review = await reviewCollection.findOneAndUpdate(
+            { _id: new ObjectId(reviewId) },
+            {
+              $set: {
+                isApproved: false,
+                isRejected: true,
+                rejectedAt: new Date(),
+                rejectedBy: new ObjectId(req.user.userId),
+                rejectionReason: reason || "Does not meet community guidelines",
+              },
+            },
+            { returnDocument: "after" },
+          );
+
+          if (!review) {
+            return res.status(404).json({
+              success: false,
+              message: "Review not found",
+            });
+          }
+
+          // Send notification to user
+          await notificationService.sendToUser(review.userId, {
+            type: "review",
+            message: "Your review was not approved",
+            details:
+              reason ||
+              "Your review did not meet our community guidelines. Please review and resubmit.",
+            actionUrl: `/courses/${review.courseId}`,
+          });
+
+          res.json({
+            success: true,
+            message: "Review rejected successfully",
+            review,
+          });
+        } catch (error) {
+          console.error("Reject review error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to reject review",
+          });
+        }
+      },
+    );
+
+    // PATCH - Feature/Unfeature review (Admin only)
+    app.patch(
+      "/admin/reviews/:reviewId/feature",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const { reviewId } = req.params;
+          const { featured } = req.body;
+
+          const review = await reviewCollection.findOneAndUpdate(
+            { _id: new ObjectId(reviewId) },
+            { $set: { isFeatured: featured } },
+            { returnDocument: "after" },
+          );
+
+          if (!review) {
+            return res.status(404).json({
+              success: false,
+              message: "Review not found",
+            });
+          }
+
+          res.json({
+            success: true,
+            message: featured
+              ? "Review featured successfully"
+              : "Review unfeatured successfully",
+            review,
+          });
+        } catch (error) {
+          console.error("Feature review error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to update review feature status",
+          });
+        }
+      },
+    );
+
+    // DELETE - Delete review (Admin only)
+    app.delete(
+      "/admin/reviews/:reviewId",
+      authenticateToken,
+      isAdmin,
+      async (req, res) => {
+        try {
+          const { reviewId } = req.params;
+
+          const review = await reviewCollection.findOne({
+            _id: new ObjectId(reviewId),
+          });
+
+          if (!review) {
+            return res.status(404).json({
+              success: false,
+              message: "Review not found",
+            });
+          }
+
+          await reviewCollection.deleteOne({ _id: new ObjectId(reviewId) });
+
+          // Update course rating stats
+          await updateCourseRatingStats(review.courseId);
+
+          res.json({
+            success: true,
+            message: "Review deleted successfully",
+          });
+        } catch (error) {
+          console.error("Delete review error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to delete review",
+          });
+        }
+      },
+    );
+
     // Start server
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
