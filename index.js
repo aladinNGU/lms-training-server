@@ -3688,45 +3688,109 @@ async function run() {
     });
 
     // PUT update lesson
-    // app.put("/lessons/:lessonId", async (req, res) => {
-    //   try {
-    //     const { lessonId } = req.params;
-    //     const { title, description, order } = req.body;
+    app.put("/lessons/:lessonId", async (req, res) => {
+      try {
+        const { lessonId } = req.params;
+        const { title, description, order } = req.body;
 
-    //     // Validate ID
-    //     if (!ObjectId.isValid(lessonId)) {
+        // Validate ID
+        if (!ObjectId.isValid(lessonId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid lesson ID format",
+          });
+        }
+
+        // Get current lesson to find chapterId for later
+        const currentLesson = await db.collection("lessons").findOne({
+          _id: new ObjectId(lessonId),
+        });
+
+        if (!currentLesson) {
+          return res.status(404).json({
+            success: false,
+            message: "Lesson not found",
+          });
+        }
+
+        const updateData = {
+          ...(title && { title }),
+          ...(description !== undefined && { description }),
+          ...(order && { order: parseInt(order) }),
+          updatedAt: new Date(),
+        };
+
+        const result = await db
+          .collection("lessons")
+          .updateOne({ _id: new ObjectId(lessonId) }, { $set: updateData });
+
+        res.json({
+          success: true,
+          message: "Lesson updated successfully",
+        });
+      } catch (error) {
+        console.error("Update lesson error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to update lesson",
+          error: error.message,
+        });
+      }
+    });
+
+    // UPDATE lesson
+    // app.patch("/lessons/:id", authenticateToken, async (req, res) => {
+    //   try {
+    //     const { id } = req.params;
+
+    //     if (!ObjectId.isValid(id)) {
     //       return res.status(400).json({
     //         success: false,
-    //         message: "Invalid lesson ID format",
+    //         message: "Invalid lesson ID",
     //       });
     //     }
 
-    //     // Get current lesson to find chapterId for later
-    //     const currentLesson = await db.collection("lessons").findOne({
-    //       _id: new ObjectId(lessonId),
+    //     const lesson = await lessonCollection.findOne({
+    //       _id: new ObjectId(id),
     //     });
 
-    //     if (!currentLesson) {
+    //     if (!lesson) {
     //       return res.status(404).json({
     //         success: false,
     //         message: "Lesson not found",
     //       });
     //     }
 
-    //     const updateData = {
-    //       ...(title && { title }),
-    //       ...(description !== undefined && { description }),
-    //       ...(order && { order: parseInt(order) }),
-    //       updatedAt: new Date(),
-    //     };
+    //     // Check permissions
+    //     const user = await userCollection.findOne({
+    //       _id: new ObjectId(req.user.userId),
+    //     });
+    //     const course = await courseCollection.findOne({ _id: lesson.courseId });
 
-    //     const result = await db
-    //       .collection("lessons")
-    //       .updateOne({ _id: new ObjectId(lessonId) }, { $set: updateData });
+    //     if (
+    //       user.role !== "admin" &&
+    //       course?.instructor?._id?.toString() !== user._id.toString()
+    //     ) {
+    //       return res.status(403).json({
+    //         success: false,
+    //         message: "Unauthorized to update this lesson",
+    //       });
+    //     }
+
+    //     const result = await lessonCollection.updateOne(
+    //       { _id: new ObjectId(id) },
+    //       {
+    //         $set: {
+    //           ...req.body,
+    //           updatedAt: new Date(),
+    //         },
+    //       },
+    //     );
 
     //     res.json({
     //       success: true,
     //       message: "Lesson updated successfully",
+    //       modifiedCount: result.modifiedCount,
     //     });
     //   } catch (error) {
     //     console.error("Update lesson error:", error);
@@ -3738,69 +3802,6 @@ async function run() {
     //   }
     // });
 
-    // UPDATE lesson
-    app.patch("/lessons/:id", authenticateToken, async (req, res) => {
-      try {
-        const { id } = req.params;
-
-        if (!ObjectId.isValid(id)) {
-          return res.status(400).json({
-            success: false,
-            message: "Invalid lesson ID",
-          });
-        }
-
-        const lesson = await lessonCollection.findOne({
-          _id: new ObjectId(id),
-        });
-
-        if (!lesson) {
-          return res.status(404).json({
-            success: false,
-            message: "Lesson not found",
-          });
-        }
-
-        // Check permissions
-        const user = await userCollection.findOne({
-          _id: new ObjectId(req.user.userId),
-        });
-        const course = await courseCollection.findOne({ _id: lesson.courseId });
-
-        if (
-          user.role !== "admin" &&
-          course?.instructor?._id?.toString() !== user._id.toString()
-        ) {
-          return res.status(403).json({
-            success: false,
-            message: "Unauthorized to update this lesson",
-          });
-        }
-
-        const result = await lessonCollection.updateOne(
-          { _id: new ObjectId(id) },
-          {
-            $set: {
-              ...req.body,
-              updatedAt: new Date(),
-            },
-          },
-        );
-
-        res.json({
-          success: true,
-          message: "Lesson updated successfully",
-          modifiedCount: result.modifiedCount,
-        });
-      } catch (error) {
-        console.error("Update lesson error:", error);
-        res.status(500).json({
-          success: false,
-          message: "Failed to update lesson",
-          error: error.message,
-        });
-      }
-    });
     // DELETE lesson
     // app.delete("/lessons/:lessonId", async (req, res) => {
     //   try {
@@ -4195,102 +4196,38 @@ async function run() {
       }
     });
 
-    // app.put("/topics/:topicId", async (req, res) => {
-    //   try {
-    //     const { topicId } = req.params;
-    //     const { title, content, order } = req.body;
-
-    //     // Validate ID
-    //     if (!ObjectId.isValid(topicId)) {
-    //       return res
-    //         .status(400)
-    //         .json({ success: false, message: "Invalid topic ID format" });
-    //     }
-
-    //     const updateData = {
-    //       ...(title && { title }),
-    //       ...(content && { content }),
-    //       ...(order && { order: parseInt(order) }),
-    //       updatedAt: new Date(),
-    //     };
-
-    //     const result = await db
-    //       .collection("topics")
-    //       .updateOne({ _id: new ObjectId(topicId) }, { $set: updateData });
-
-    //     if (result.matchedCount === 0) {
-    //       return res
-    //         .status(404)
-    //         .json({ success: false, message: "Topic not found" });
-    //     }
-
-    //     res.json({
-    //       success: true,
-    //       message: "Topic updated successfully",
-    //     });
-    //   } catch (error) {
-    //     console.error("Update topic error:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       message: "Failed to update topic",
-    //       error: error.message,
-    //     });
-    //   }
-    // });
-
-    // DELETE topic
-
-    // UPDATE topic
-    app.patch("/topics/:id", authenticateToken, async (req, res) => {
+    app.put("/topics/:topicId", async (req, res) => {
       try {
-        const { id } = req.params;
+        const { topicId } = req.params;
+        const { title, content, order } = req.body;
 
-        if (!ObjectId.isValid(id)) {
-          return res.status(400).json({
-            success: false,
-            message: "Invalid topic ID",
-          });
+        // Validate ID
+        if (!ObjectId.isValid(topicId)) {
+          return res
+            .status(400)
+            .json({ success: false, message: "Invalid topic ID format" });
         }
 
-        const topic = await topicCollection.findOne({ _id: new ObjectId(id) });
+        const updateData = {
+          ...(title && { title }),
+          ...(content && { content }),
+          ...(order && { order: parseInt(order) }),
+          updatedAt: new Date(),
+        };
 
-        if (!topic) {
-          return res.status(404).json({
-            success: false,
-            message: "Topic not found",
-          });
+        const result = await db
+          .collection("topics")
+          .updateOne({ _id: new ObjectId(topicId) }, { $set: updateData });
+
+        if (result.matchedCount === 0) {
+          return res
+            .status(404)
+            .json({ success: false, message: "Topic not found" });
         }
-
-        // Check permissions
-        const user = await userCollection.findOne({
-          _id: new ObjectId(req.user.userId),
-        });
-        const course = await courseCollection.findOne({ _id: topic.courseId });
-
-        if (
-          user.role !== "admin" &&
-          course?.instructor?._id?.toString() !== user._id.toString()
-        ) {
-          return res.status(403).json({
-            success: false,
-            message: "Unauthorized to update this topic",
-          });
-        }
-
-        const result = await topicCollection.updateOne(
-          { _id: new ObjectId(id) },
-          {
-            $set: {
-              ...req.body,
-              updatedAt: new Date(),
-            },
-          },
-        );
 
         res.json({
           success: true,
           message: "Topic updated successfully",
-          modifiedCount: result.modifiedCount,
         });
       } catch (error) {
         console.error("Update topic error:", error);
@@ -4301,6 +4238,70 @@ async function run() {
         });
       }
     });
+
+    // DELETE topic
+
+    // UPDATE topic
+    // app.patch("/topics/:id", authenticateToken, async (req, res) => {
+    //   try {
+    //     const { id } = req.params;
+
+    //     if (!ObjectId.isValid(id)) {
+    //       return res.status(400).json({
+    //         success: false,
+    //         message: "Invalid topic ID",
+    //       });
+    //     }
+
+    //     const topic = await topicCollection.findOne({ _id: new ObjectId(id) });
+
+    //     if (!topic) {
+    //       return res.status(404).json({
+    //         success: false,
+    //         message: "Topic not found",
+    //       });
+    //     }
+
+    //     // Check permissions
+    //     const user = await userCollection.findOne({
+    //       _id: new ObjectId(req.user.userId),
+    //     });
+    //     const course = await courseCollection.findOne({ _id: topic.courseId });
+
+    //     if (
+    //       user.role !== "admin" &&
+    //       course?.instructor?._id?.toString() !== user._id.toString()
+    //     ) {
+    //       return res.status(403).json({
+    //         success: false,
+    //         message: "Unauthorized to update this topic",
+    //       });
+    //     }
+
+    //     const result = await topicCollection.updateOne(
+    //       { _id: new ObjectId(id) },
+    //       {
+    //         $set: {
+    //           ...req.body,
+    //           updatedAt: new Date(),
+    //         },
+    //       },
+    //     );
+
+    //     res.json({
+    //       success: true,
+    //       message: "Topic updated successfully",
+    //       modifiedCount: result.modifiedCount,
+    //     });
+    //   } catch (error) {
+    //     console.error("Update topic error:", error);
+    //     res.status(500).json({
+    //       success: false,
+    //       message: "Failed to update topic",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
 
     // app.delete("/topics/:topicId", async (req, res) => {
     //   try {
