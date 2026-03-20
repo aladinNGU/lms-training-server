@@ -3105,106 +3105,40 @@ async function run() {
     });
 
     // PUT update chapter
-    // app.put("/chapters/:chapterId", async (req, res) => {
-    //   try {
-    //     const { chapterId } = req.params;
-    //     const { title, description, order } = req.body;
-
-    //     // Validate ID
-    //     if (!ObjectId.isValid(chapterId)) {
-    //       return res.status(400).json({
-    //         success: false,
-    //         message: "Invalid chapter ID format",
-    //       });
-    //     }
-
-    //     const updateData = {
-    //       ...(title && { title }),
-    //       ...(description !== undefined && { description }),
-    //       ...(order && { order: parseInt(order) }),
-    //       updatedAt: new Date(),
-    //     };
-
-    //     const result = await db
-    //       .collection("chapters")
-    //       .updateOne({ _id: new ObjectId(chapterId) }, { $set: updateData });
-
-    //     if (result.matchedCount === 0) {
-    //       return res.status(404).json({
-    //         success: false,
-    //         message: "Chapter not found",
-    //       });
-    //     }
-
-    //     res.json({
-    //       success: true,
-    //       message: "Chapter updated successfully",
-    //     });
-    //   } catch (error) {
-    //     console.error("Update chapter error:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       message: "Failed to update chapter",
-    //       error: error.message,
-    //     });
-    //   }
-    // });
-
-    // UPDATE chapter
-    app.patch("/chapters/:id", authenticateToken, async (req, res) => {
+    app.put("/chapters/:chapterId", async (req, res) => {
       try {
-        const { id } = req.params;
+        const { chapterId } = req.params;
+        const { title, description, order } = req.body;
 
-        if (!ObjectId.isValid(id)) {
+        // Validate ID
+        if (!ObjectId.isValid(chapterId)) {
           return res.status(400).json({
             success: false,
-            message: "Invalid chapter ID",
+            message: "Invalid chapter ID format",
           });
         }
 
-        const chapter = await chapterCollection.findOne({
-          _id: new ObjectId(id),
-        });
+        const updateData = {
+          ...(title && { title }),
+          ...(description !== undefined && { description }),
+          ...(order && { order: parseInt(order) }),
+          updatedAt: new Date(),
+        };
 
-        if (!chapter) {
+        const result = await db
+          .collection("chapters")
+          .updateOne({ _id: new ObjectId(chapterId) }, { $set: updateData });
+
+        if (result.matchedCount === 0) {
           return res.status(404).json({
             success: false,
             message: "Chapter not found",
           });
         }
 
-        // Check permissions
-        const user = await userCollection.findOne({
-          _id: new ObjectId(req.user.userId),
-        });
-        const course = await courseCollection.findOne({
-          _id: chapter.courseId,
-        });
-
-        if (
-          user.role !== "admin" &&
-          course?.instructor?._id?.toString() !== user._id.toString()
-        ) {
-          return res.status(403).json({
-            success: false,
-            message: "Unauthorized to update this chapter",
-          });
-        }
-
-        const result = await chapterCollection.updateOne(
-          { _id: new ObjectId(id) },
-          {
-            $set: {
-              ...req.body,
-              updatedAt: new Date(),
-            },
-          },
-        );
-
         res.json({
           success: true,
           message: "Chapter updated successfully",
-          modifiedCount: result.modifiedCount,
         });
       } catch (error) {
         console.error("Update chapter error:", error);
@@ -3215,6 +3149,72 @@ async function run() {
         });
       }
     });
+
+    // UPDATE chapter
+    // app.patch("/chapters/:id", authenticateToken, async (req, res) => {
+    //   try {
+    //     const { id } = req.params;
+
+    //     if (!ObjectId.isValid(id)) {
+    //       return res.status(400).json({
+    //         success: false,
+    //         message: "Invalid chapter ID",
+    //       });
+    //     }
+
+    //     const chapter = await chapterCollection.findOne({
+    //       _id: new ObjectId(id),
+    //     });
+
+    //     if (!chapter) {
+    //       return res.status(404).json({
+    //         success: false,
+    //         message: "Chapter not found",
+    //       });
+    //     }
+
+    //     // Check permissions
+    //     const user = await userCollection.findOne({
+    //       _id: new ObjectId(req.user.userId),
+    //     });
+    //     const course = await courseCollection.findOne({
+    //       _id: chapter.courseId,
+    //     });
+
+    //     if (
+    //       user.role !== "admin" &&
+    //       course?.instructor?._id?.toString() !== user._id.toString()
+    //     ) {
+    //       return res.status(403).json({
+    //         success: false,
+    //         message: "Unauthorized to update this chapter",
+    //       });
+    //     }
+
+    //     const result = await chapterCollection.updateOne(
+    //       { _id: new ObjectId(id) },
+    //       {
+    //         $set: {
+    //           ...req.body,
+    //           updatedAt: new Date(),
+    //         },
+    //       },
+    //     );
+
+    //     res.json({
+    //       success: true,
+    //       message: "Chapter updated successfully",
+    //       modifiedCount: result.modifiedCount,
+    //     });
+    //   } catch (error) {
+    //     console.error("Update chapter error:", error);
+    //     res.status(500).json({
+    //       success: false,
+    //       message: "Failed to update chapter",
+    //       error: error.message,
+    //     });
+    //   }
+    // });
 
     // DELETE chapter
     // app.delete("/chapters/:chapterId", async (req, res) => {
