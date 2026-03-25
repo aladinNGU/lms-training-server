@@ -4010,6 +4010,1077 @@ async function run() {
       }
     });
 
+    // ==================== TOPIC APIs ====================
+
+    // CREATE topic with blocks (including code blocks with highlighting)
+    app.post(
+      "/lessons/:lessonId/topics",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { lessonId } = req.params;
+          const { title, description, blocks, order } = req.body;
+
+          // Validate lesson exists
+          if (!ObjectId.isValid(lessonId)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid lesson ID format",
+            });
+          }
+
+          const lesson = await lessonCollection.findOne({
+            _id: new ObjectId(lessonId),
+          });
+
+          if (!lesson) {
+            return res.status(404).json({
+              success: false,
+              message: "Lesson not found",
+            });
+          }
+
+          // Check permissions
+          const user = await userCollection.findOne({
+            _id: new ObjectId(req.user.userId),
+          });
+          const course = await courseCollection.findOne({
+            _id: lesson.courseId,
+          });
+
+          if (
+            user.role !== "admin" &&
+            course?.instructor?._id?.toString() !== user._id.toString()
+          ) {
+            return res.status(403).json({
+              success: false,
+              message: "Unauthorized to add topics to this lesson",
+            });
+          }
+
+          const newTopic = {
+            _id: new ObjectId(),
+            lessonId: new ObjectId(lessonId),
+            courseId: lesson.courseId,
+            chapterId: lesson.chapterId,
+            title,
+            description: description || "",
+            order: order || 0,
+            blocks: blocks.map((block, index) => ({
+              id: new ObjectId(),
+              order: index,
+              type: block.type,
+              content: block.content,
+              ...(block.type === "code" && {
+                language: block.language || "javascript",
+                highlightedLines: block.highlightedLines || [],
+                showLineNumbers: block.showLineNumbers !== false,
+                variant: block.variant || "default",
+              }),
+              ...(block.type === "text" && {
+                style: block.style || "normal",
+              }),
+              ...(block.type === "note" && {
+                variant: block.variant || "info",
+              }),
+              ...(block.type === "component" && {
+                component: block.component,
+                props: block.props || {},
+              }),
+              ...(block.type === "quiz" && {
+                question: block.question,
+                options: block.options || [],
+                correctAnswer: block.correctAnswer,
+              }),
+              ...(block.type === "list" && {
+                items: block.items || [],
+                listType: block.listType || "unordered",
+              }),
+              ...(block.type === "resource" && {
+                resources: block.resources || [],
+                resourceType: block.resourceType,
+              }),
+              metadata: {
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+            })),
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+
+          const result = await topicCollection.insertOne(newTopic);
+
+          // Update lesson topics count
+          await lessonCollection.updateOne(
+            { _id: new ObjectId(lessonId) },
+            { $inc: { topicsCount: 1 } },
+          );
+
+          // Update course stats
+          await courseCollection.updateOne(
+            { _id: lesson.courseId },
+            { $inc: { "stats.totalTopics": 1 } },
+          );
+
+          res.status(201).json({
+            success: true,
+            message: "Topic created successfully",
+            topic: { ...newTopic, _id: result.insertedId },
+          });
+        } catch (error) {
+          console.error("Create topic error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to create topic",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // GET single topic by ID
+    app.get("/lessons/:lessonId/topics/:topicId", async (req, res) => {
+      try {
+        const { lessonId, topicId } = req.params;
+
+        if (!ObjectId.isValid(topicId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid topic ID format",
+          });
+        }
+
+        const topic = await topicCollection.findOne({
+          _id: new ObjectId(topicId),
+          lessonId: new ObjectId(lessonId),
+        });
+
+        if (!topic) {
+          return res.status(404).json({
+            success: false,
+            message: "Topic not found",
+          });
+        }
+
+        res.json({ success: true, topic });
+      } catch (error) {
+        console.error("Get topic error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to get topic",
+          error: error.message,
+        });
+      }
+    });
+
+    // UPDATE topic
+    app.put(
+      "/lessons/:lessonId/topics/:topicId",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { lessonId, topicId } = req.params;
+          const { title, description, blocks, order } = req.body;
+
+          if (!ObjectId.isValid(topicId)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid topic ID format",
+            });
+          }
+
+          // Check permissions
+          const lesson = await lessonCollection.findOne({
+            _id: new ObjectId(lessonId),
+          });
+          const user = await userCollection.findOne({
+            _id: new ObjectId(req.user.userId),
+          });
+          const course = await courseCollection.findOne({
+            _id: lesson.courseId,
+          });
+
+          if (
+            user.role !== "admin" &&
+            course?.instructor?._id?.toString() !== user._id.toString()
+          ) {
+            return res.status(403).json({
+              success: false,
+              message: "Unauthorized to update this topic",
+            });
+          }
+
+          const updateData = {
+            ...(title && { title }),
+            ...(description !== undefined && { description }),
+            ...(order !== undefined && { order }),
+            ...(blocks && {
+              blocks: blocks.map((block, index) => ({
+                ...block,
+                order: index,
+                metadata: {
+                  ...block.metadata,
+                  updatedAt: new Date(),
+                },
+              })),
+            }),
+            updatedAt: new Date(),
+          };
+
+          const result = await topicCollection.updateOne(
+            { _id: new ObjectId(topicId), lessonId: new ObjectId(lessonId) },
+            { $set: updateData },
+          );
+
+          if (result.matchedCount === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "Topic not found",
+            });
+          }
+
+          res.json({
+            success: true,
+            message: "Topic updated successfully",
+          });
+        } catch (error) {
+          console.error("Update topic error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to update topic",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // DELETE topic
+    app.delete(
+      "/lessons/:lessonId/topics/:topicId",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { lessonId, topicId } = req.params;
+
+          if (!ObjectId.isValid(topicId)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid topic ID format",
+            });
+          }
+
+          // Check permissions
+          const lesson = await lessonCollection.findOne({
+            _id: new ObjectId(lessonId),
+          });
+          const user = await userCollection.findOne({
+            _id: new ObjectId(req.user.userId),
+          });
+          const course = await courseCollection.findOne({
+            _id: lesson.courseId,
+          });
+
+          if (
+            user.role !== "admin" &&
+            course?.instructor?._id?.toString() !== user._id.toString()
+          ) {
+            return res.status(403).json({
+              success: false,
+              message: "Unauthorized to delete this topic",
+            });
+          }
+
+          const result = await topicCollection.deleteOne({
+            _id: new ObjectId(topicId),
+            lessonId: new ObjectId(lessonId),
+          });
+
+          if (result.deletedCount === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "Topic not found",
+            });
+          }
+
+          // Update lesson topics count
+          await lessonCollection.updateOne(
+            { _id: new ObjectId(lessonId) },
+            { $inc: { topicsCount: -1 } },
+          );
+
+          // Update course stats
+          await courseCollection.updateOne(
+            { _id: lesson.courseId },
+            { $inc: { "stats.totalTopics": -1 } },
+          );
+
+          res.json({
+            success: true,
+            message: "Topic deleted successfully",
+          });
+        } catch (error) {
+          console.error("Delete topic error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to delete topic",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // ==================== BLOCK APIs (with Code Block Highlighting) ====================
+
+    // ADD block to topic
+    app.post(
+      "/lessons/:lessonId/topics/:topicId/blocks",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { lessonId, topicId } = req.params;
+          const { type, content, ...blockSpecificData } = req.body;
+
+          if (!ObjectId.isValid(topicId)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid topic ID format",
+            });
+          }
+
+          // Check permissions
+          const lesson = await lessonCollection.findOne({
+            _id: new ObjectId(lessonId),
+          });
+          const user = await userCollection.findOne({
+            _id: new ObjectId(req.user.userId),
+          });
+          const course = await courseCollection.findOne({
+            _id: lesson.courseId,
+          });
+
+          if (
+            user.role !== "admin" &&
+            course?.instructor?._id?.toString() !== user._id.toString()
+          ) {
+            return res.status(403).json({
+              success: false,
+              message: "Unauthorized to add blocks to this topic",
+            });
+          }
+
+          const newBlock = {
+            id: new ObjectId(),
+            type,
+            content,
+            ...(type === "code" && {
+              language: blockSpecificData.language || "javascript",
+              highlightedLines: blockSpecificData.highlightedLines || [],
+              showLineNumbers: blockSpecificData.showLineNumbers !== false,
+              variant: blockSpecificData.variant || "default",
+            }),
+            ...(type === "text" && {
+              style: blockSpecificData.style || "normal",
+            }),
+            ...(type === "note" && {
+              variant: blockSpecificData.variant || "info",
+            }),
+            ...(type === "component" && {
+              component: blockSpecificData.component,
+              props: blockSpecificData.props || {},
+            }),
+            metadata: {
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            },
+          };
+
+          const result = await topicCollection.updateOne(
+            { _id: new ObjectId(topicId), lessonId: new ObjectId(lessonId) },
+            { $push: { blocks: newBlock } },
+          );
+
+          if (result.matchedCount === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "Topic not found",
+            });
+          }
+
+          res.status(201).json({
+            success: true,
+            message: "Block added successfully",
+            block: newBlock,
+          });
+        } catch (error) {
+          console.error("Add block error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to add block",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // GET all blocks for a topic
+    app.get("/lessons/:lessonId/topics/:topicId/blocks", async (req, res) => {
+      try {
+        const { lessonId, topicId } = req.params;
+
+        if (!ObjectId.isValid(topicId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid topic ID format",
+          });
+        }
+
+        const topic = await topicCollection.findOne(
+          {
+            _id: new ObjectId(topicId),
+            lessonId: new ObjectId(lessonId),
+          },
+          { projection: { blocks: 1 } },
+        );
+
+        if (!topic) {
+          return res.status(404).json({
+            success: false,
+            message: "Topic not found",
+          });
+        }
+
+        res.json({
+          success: true,
+          blocks: topic.blocks || [],
+        });
+      } catch (error) {
+        console.error("Get blocks error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to get blocks",
+          error: error.message,
+        });
+      }
+    });
+
+    // GET single block
+    app.get(
+      "/lessons/:lessonId/topics/:topicId/blocks/:blockId",
+      async (req, res) => {
+        try {
+          const { lessonId, topicId, blockId } = req.params;
+
+          if (!ObjectId.isValid(topicId) || !ObjectId.isValid(blockId)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid ID format",
+            });
+          }
+
+          const topic = await topicCollection.findOne(
+            {
+              _id: new ObjectId(topicId),
+              lessonId: new ObjectId(lessonId),
+              "blocks.id": new ObjectId(blockId),
+            },
+            { projection: { "blocks.$": 1 } },
+          );
+
+          if (!topic || !topic.blocks || topic.blocks.length === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "Block not found",
+            });
+          }
+
+          res.json({
+            success: true,
+            block: topic.blocks[0],
+          });
+        } catch (error) {
+          console.error("Get block error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to get block",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // UPDATE block (with support for code block highlighting)
+    app.put(
+      "/lessons/:lessonId/topics/:topicId/blocks/:blockId",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { lessonId, topicId, blockId } = req.params;
+          const updateData = req.body;
+
+          if (!ObjectId.isValid(topicId) || !ObjectId.isValid(blockId)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid ID format",
+            });
+          }
+
+          // Check permissions
+          const lesson = await lessonCollection.findOne({
+            _id: new ObjectId(lessonId),
+          });
+          const user = await userCollection.findOne({
+            _id: new ObjectId(req.user.userId),
+          });
+          const course = await courseCollection.findOne({
+            _id: lesson.courseId,
+          });
+
+          if (
+            user.role !== "admin" &&
+            course?.instructor?._id?.toString() !== user._id.toString()
+          ) {
+            return res.status(403).json({
+              success: false,
+              message: "Unauthorized to update this block",
+            });
+          }
+
+          // Build dynamic update object for array filter
+          const updateFields = {};
+
+          if (updateData.content !== undefined) {
+            updateFields["blocks.$[block].content"] = updateData.content;
+          }
+
+          if (updateData.language !== undefined) {
+            updateFields["blocks.$[block].language"] = updateData.language;
+          }
+
+          if (updateData.highlightedLines !== undefined) {
+            updateFields["blocks.$[block].highlightedLines"] =
+              updateData.highlightedLines;
+          }
+
+          if (updateData.showLineNumbers !== undefined) {
+            updateFields["blocks.$[block].showLineNumbers"] =
+              updateData.showLineNumbers;
+          }
+
+          if (updateData.variant !== undefined) {
+            updateFields["blocks.$[block].variant"] = updateData.variant;
+          }
+
+          if (updateData.style !== undefined) {
+            updateFields["blocks.$[block].style"] = updateData.style;
+          }
+
+          if (updateData.component !== undefined) {
+            updateFields["blocks.$[block].component"] = updateData.component;
+          }
+
+          if (updateData.props !== undefined) {
+            updateFields["blocks.$[block].props"] = updateData.props;
+          }
+
+          // Always update metadata
+          updateFields["blocks.$[block].metadata.updatedAt"] = new Date();
+
+          const result = await topicCollection.updateOne(
+            {
+              _id: new ObjectId(topicId),
+              lessonId: new ObjectId(lessonId),
+            },
+            { $set: updateFields },
+            {
+              arrayFilters: [{ "block.id": new ObjectId(blockId) }],
+            },
+          );
+
+          if (result.matchedCount === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "Block not found",
+            });
+          }
+
+          res.json({
+            success: true,
+            message: "Block updated successfully",
+          });
+        } catch (error) {
+          console.error("Update block error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to update block",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // DELETE block
+    app.delete(
+      "/lessons/:lessonId/topics/:topicId/blocks/:blockId",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { lessonId, topicId, blockId } = req.params;
+
+          if (!ObjectId.isValid(topicId) || !ObjectId.isValid(blockId)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid ID format",
+            });
+          }
+
+          // Check permissions
+          const lesson = await lessonCollection.findOne({
+            _id: new ObjectId(lessonId),
+          });
+          const user = await userCollection.findOne({
+            _id: new ObjectId(req.user.userId),
+          });
+          const course = await courseCollection.findOne({
+            _id: lesson.courseId,
+          });
+
+          if (
+            user.role !== "admin" &&
+            course?.instructor?._id?.toString() !== user._id.toString()
+          ) {
+            return res.status(403).json({
+              success: false,
+              message: "Unauthorized to delete this block",
+            });
+          }
+
+          const result = await topicCollection.updateOne(
+            {
+              _id: new ObjectId(topicId),
+              lessonId: new ObjectId(lessonId),
+            },
+            {
+              $pull: {
+                blocks: { id: new ObjectId(blockId) },
+              },
+            },
+          );
+
+          if (result.matchedCount === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "Topic not found",
+            });
+          }
+
+          res.json({
+            success: true,
+            message: "Block deleted successfully",
+          });
+        } catch (error) {
+          console.error("Delete block error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to delete block",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // ==================== CODE BLOCK SPECIFIC APIs ====================
+
+    // UPDATE highlighted lines for code block
+    app.patch(
+      "/lessons/:lessonId/topics/:topicId/blocks/:blockId/highlights",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { lessonId, topicId, blockId } = req.params;
+          const { highlightedLines, action } = req.body; // action: 'set', 'add', 'remove'
+
+          if (!ObjectId.isValid(topicId) || !ObjectId.isValid(blockId)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid ID format",
+            });
+          }
+
+          // Check permissions
+          const lesson = await lessonCollection.findOne({
+            _id: new ObjectId(lessonId),
+          });
+          const user = await userCollection.findOne({
+            _id: new ObjectId(req.user.userId),
+          });
+          const course = await courseCollection.findOne({
+            _id: lesson.courseId,
+          });
+
+          if (
+            user.role !== "admin" &&
+            course?.instructor?._id?.toString() !== user._id.toString()
+          ) {
+            return res.status(403).json({
+              success: false,
+              message: "Unauthorized to update highlights",
+            });
+          }
+
+          let updateOperation;
+
+          switch (action) {
+            case "add":
+              updateOperation = {
+                $addToSet: {
+                  "blocks.$[block].highlightedLines": {
+                    $each: highlightedLines,
+                  },
+                },
+              };
+              break;
+            case "remove":
+              updateOperation = {
+                $pull: {
+                  "blocks.$[block].highlightedLines": { $in: highlightedLines },
+                },
+              };
+              break;
+            default:
+              // 'set' - replace entire array
+              updateOperation = {
+                $set: {
+                  "blocks.$[block].highlightedLines": highlightedLines,
+                },
+              };
+          }
+
+          // Add metadata update
+          updateOperation.$set = updateOperation.$set || {};
+          updateOperation.$set["blocks.$[block].metadata.updatedAt"] =
+            new Date();
+
+          const result = await topicCollection.updateOne(
+            {
+              _id: new ObjectId(topicId),
+              lessonId: new ObjectId(lessonId),
+            },
+            updateOperation,
+            {
+              arrayFilters: [{ "block.id": new ObjectId(blockId) }],
+            },
+          );
+
+          if (result.matchedCount === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "Code block not found",
+            });
+          }
+
+          res.json({
+            success: true,
+            message: "Highlights updated successfully",
+            modified: result.modifiedCount,
+          });
+        } catch (error) {
+          console.error("Update highlights error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to update highlights",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // GET highlighted lines for code block
+    app.get(
+      "/lessons/:lessonId/topics/:topicId/blocks/:blockId/highlights",
+      async (req, res) => {
+        try {
+          const { lessonId, topicId, blockId } = req.params;
+
+          if (!ObjectId.isValid(topicId) || !ObjectId.isValid(blockId)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid ID format",
+            });
+          }
+
+          const topic = await topicCollection.findOne(
+            {
+              _id: new ObjectId(topicId),
+              lessonId: new ObjectId(lessonId),
+              "blocks.id": new ObjectId(blockId),
+            },
+            {
+              projection: {
+                blocks: {
+                  $elemMatch: { id: new ObjectId(blockId) },
+                },
+              },
+            },
+          );
+
+          if (!topic || !topic.blocks || topic.blocks.length === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "Code block not found",
+            });
+          }
+
+          const block = topic.blocks[0];
+
+          res.json({
+            success: true,
+            highlightedLines: block.highlightedLines || [],
+            language: block.language,
+            code: block.content,
+            showLineNumbers: block.showLineNumbers !== false,
+          });
+        } catch (error) {
+          console.error("Get highlights error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to get highlights",
+            error: error.message,
+          });
+        }
+      },
+    );
+
+    // ==================== SEARCH APIs ====================
+
+    // Search across lessons and topics (with code block content)
+    app.get("/search", async (req, res) => {
+      try {
+        const { q, type, limit = 20 } = req.query;
+
+        if (!q) {
+          return res.status(400).json({
+            success: false,
+            message: "Search query required",
+          });
+        }
+
+        const searchRegex = new RegExp(q, "i");
+        let results = {
+          lessons: [],
+          topics: [],
+          codeBlocks: [],
+        };
+
+        // Search in lessons
+        const lessons = await lessonCollection
+          .find({
+            $or: [{ title: searchRegex }, { description: searchRegex }],
+          })
+          .limit(parseInt(limit))
+          .toArray();
+
+        results.lessons = lessons;
+
+        // Search in topics
+        const topics = await topicCollection
+          .find({
+            $or: [
+              { title: searchRegex },
+              { description: searchRegex },
+              { "blocks.content": searchRegex },
+              { "blocks.highlightedLines": { $exists: true } }, // Include topics with highlighted code
+            ],
+          })
+          .limit(parseInt(limit))
+          .toArray();
+
+        results.topics = topics;
+
+        // Search specifically in code blocks
+        const codeBlocks = await topicCollection
+          .aggregate([
+            { $unwind: "$blocks" },
+            {
+              $match: {
+                "blocks.type": "code",
+                $or: [
+                  { "blocks.content": searchRegex },
+                  { "blocks.language": searchRegex },
+                ],
+              },
+            },
+            {
+              $project: {
+                topicTitle: "$title",
+                blockContent: "$blocks.content",
+                language: "$blocks.language",
+                highlightedLines: "$blocks.highlightedLines",
+                lessonId: 1,
+              },
+            },
+            { $limit: parseInt(limit) },
+          ])
+          .toArray();
+
+        results.codeBlocks = codeBlocks;
+
+        res.json({
+          success: true,
+          results,
+          total: lessons.length + topics.length + codeBlocks.length,
+        });
+      } catch (error) {
+        console.error("Search error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to search",
+          error: error.message,
+        });
+      }
+    });
+
+    // ==================== ANALYTICS APIs ====================
+
+    // Get code block analytics
+    app.get("/analytics/code-blocks", async (req, res) => {
+      try {
+        const stats = await topicCollection
+          .aggregate([
+            { $unwind: "$blocks" },
+            { $match: { "blocks.type": "code" } },
+            {
+              $group: {
+                _id: null,
+                totalCodeBlocks: { $sum: 1 },
+                totalHighlightedLines: {
+                  $sum: {
+                    $size: { $ifNull: ["$blocks.highlightedLines", []] },
+                  },
+                },
+                languages: { $addToSet: "$blocks.language" },
+                averageHighlightsPerBlock: {
+                  $avg: {
+                    $size: { $ifNull: ["$blocks.highlightedLines", []] },
+                  },
+                },
+                blocksWithHighlights: {
+                  $sum: {
+                    $cond: [
+                      {
+                        $gt: [
+                          {
+                            $size: {
+                              $ifNull: ["$blocks.highlightedLines", []],
+                            },
+                          },
+                          0,
+                        ],
+                      },
+                      1,
+                      0,
+                    ],
+                  },
+                },
+              },
+            },
+          ])
+          .toArray();
+
+        // Get top highlighted code blocks
+        const topHighlighted = await topicCollection
+          .aggregate([
+            { $unwind: "$blocks" },
+            {
+              $match: {
+                "blocks.type": "code",
+                $expr: { $gt: [{ $size: "$blocks.highlightedLines" }, 0] },
+              },
+            },
+            {
+              $project: {
+                topicTitle: "$title",
+                language: "$blocks.language",
+                highlightCount: { $size: "$blocks.highlightedLines" },
+                highlightedLines: "$blocks.highlightedLines",
+              },
+            },
+            { $sort: { highlightCount: -1 } },
+            { $limit: 10 },
+          ])
+          .toArray();
+
+        res.json({
+          success: true,
+          stats: stats[0] || {
+            totalCodeBlocks: 0,
+            totalHighlightedLines: 0,
+            languages: [],
+            averageHighlightsPerBlock: 0,
+            blocksWithHighlights: 0,
+          },
+          topHighlighted,
+        });
+      } catch (error) {
+        console.error("Analytics error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to get analytics",
+          error: error.message,
+        });
+      }
+    });
+
+    // Get lesson-specific code block analytics
+    app.get("/lessons/:lessonId/analytics/code-blocks", async (req, res) => {
+      try {
+        const { lessonId } = req.params;
+
+        if (!ObjectId.isValid(lessonId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid lesson ID format",
+          });
+        }
+
+        const stats = await topicCollection
+          .aggregate([
+            { $match: { lessonId: new ObjectId(lessonId) } },
+            { $unwind: "$blocks" },
+            { $match: { "blocks.type": "code" } },
+            {
+              $group: {
+                _id: "$lessonId",
+                totalCodeBlocks: { $sum: 1 },
+                totalHighlightedLines: {
+                  $sum: {
+                    $size: { $ifNull: ["$blocks.highlightedLines", []] },
+                  },
+                },
+                topicsWithCode: { $addToSet: "$_id" },
+              },
+            },
+          ])
+          .toArray();
+
+        res.json({
+          success: true,
+          stats: stats[0] || {
+            totalCodeBlocks: 0,
+            totalHighlightedLines: 0,
+            topicsWithCode: [],
+          },
+        });
+      } catch (error) {
+        console.error("Lesson analytics error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to get lesson analytics",
+          error: error.message,
+        });
+      }
+    });
+
     // GET single topic by ID
     app.get("/topics/:topicId", async (req, res) => {
       try {
