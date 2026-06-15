@@ -8,17 +8,40 @@ const axios = require("axios");
 const { MongoClient, ObjectId, ServerApiVersion } = require("mongodb");
 require("dotenv").config();
 const PDFDocument = require("pdfkit");
+const helmet = require("helmet");
+const compression = require("compression");
+const morgan = require("morgan");
+const rateLimit = require("express-rate-limit");
 
 const app = express();
-const PORT = process.env.PORT || 7000;
+const PORT = process.env.PORT || 5000;
+
+const api = express.Router();
+
+const isDev = process.env.NODE_ENV !== "production";
+
+const logger = {
+  log: (...args) => {
+    if (isDev) {
+      console.log(...args);
+    }
+  },
+  error: (...args) => console.error(...args),
+  warn: (...args) => console.warn(...args),
+};
+
+app.set("trust proxy", 1);
 
 // Middleware
 app.use(
   cors({
     origin: [
       "http://localhost:5173",
-      "http://localhost:7000",
-      "http://127.0.0.1:5174",
+      "http://localhost:5174",
+      "http://localhost:5175",
+      "http://localhost:5176",
+      "https://bdprogramming.com",
+      "https://www.bdprogramming.com",
     ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
@@ -26,6 +49,22 @@ app.use(
   }),
 );
 app.use(express.json());
+app.use(helmet());
+app.use(compression());
+app.use(morgan("combined"));
+
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many requests. Please try again later.",
+  },
+});
+
+app.use(globalLimiter);
 
 // bKash Configuration
 const BKASH_CONFIG = {
@@ -35,6 +74,10 @@ const BKASH_CONFIG = {
   password: process.env.BKASH_PASSWORD,
   base_url: process.env.BKASH_BASE_URL,
   frontend_url: process.env.BKASH_FRONTEND_URL,
+};
+
+const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
 };
 
 // Slug Generator Functions
@@ -60,8 +103,32 @@ async function createUniqueSlug(title, collection) {
   return uniqueSlug;
 }
 
-// MongoDB Connection
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.zn6isea.mongodb.net/?appName=Cluster0`;
+// Validate required environment variables
+const requiredEnvVars = ["JWT_SECRET", "EMAIL_USER", "EMAIL_PASS"];
+const missingVars = requiredEnvVars.filter((varName) => !process.env[varName]);
+
+if (missingVars.length > 0) {
+  logger.error(
+    `❌ Missing required environment variables: ${missingVars.join(", ")}`,
+  );
+  process.exit(1);
+}
+
+if (
+  process.env.NODE_ENV === "production" &&
+  !process.env.RECAPTCHA_SECRET_KEY
+) {
+  logger.warn(
+    "⚠️ RECAPTCHA_SECRET_KEY not set. reCAPTCHA verification will fail!",
+  );
+}
+// MongoDB local connection
+// const uri = "mongodb://localhost:27017";
+
+// MongoDB Atlas Connection
+// const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.zn6isea.mongodb.net/?appName=Cluster0`;
+
+const uri = process.env.MONGO_URI;
 
 // Create a MongoClient
 const client = new MongoClient(uri, {
@@ -72,33 +139,118 @@ const client = new MongoClient(uri, {
   },
 });
 
+// ============= ENHANCED REGISTRATION WITH RECAPTCHA & EMAIL VERIFICATION =============
+
+// reCAPTCHA verification helper
+async function verifyRecaptcha(token) {
+  try {
+    const secretKey = process.env.RECAPTCHA_SECRET_KEY;
+    if (!secretKey) {
+      logger.error("❌ RECAPTCHA_SECRET_KEY not configured");
+      return false;
+    }
+
+    const response = await axios.post(
+      "https://www.google.com/recaptcha/api/siteverify",
+      null,
+      {
+        params: {
+          secret: secretKey,
+          response: token,
+        },
+        timeout: 5000,
+      },
+    );
+
+    return response.data.success === true;
+  } catch (error) {
+    logger.error("reCAPTCHA verification error:", error);
+    return false;
+  }
+}
+
+// Check if password has been pwned
+async function isPasswordPwned(password) {
+  try {
+    const crypto = require("crypto");
+
+    const sha1 = crypto
+      .createHash("sha1")
+      .update(password)
+      .digest("hex")
+      .toUpperCase();
+
+    const prefix = sha1.slice(0, 5);
+    const suffix = sha1.slice(5);
+
+    const response = await axios.get(
+      `https://api.pwnedpasswords.com/range/${prefix}`,
+      {
+        timeout: 5000,
+      },
+    );
+
+    const data = response.data;
+
+    return data.includes(suffix);
+  } catch (error) {
+    logger.warn("Pwned passwords API error:", error.message);
+    return false;
+  }
+}
+
+global.loginAttempts = new Map();
+
+setInterval(
+  () => {
+    if (global.rateLimitStore) {
+      const now = Date.now();
+
+      for (const [key, attempts] of global.rateLimitStore.entries()) {
+        const recentAttempts = attempts.filter(
+          (timestamp) => now - timestamp < 3600000,
+        );
+
+        if (recentAttempts.length === 0) {
+          global.rateLimitStore.delete(key);
+        } else {
+          global.rateLimitStore.set(key, recentAttempts);
+        }
+      }
+    }
+    if (global.loginAttempts) {
+      const now = Date.now();
+
+      for (const [key, value] of global.loginAttempts.entries()) {
+        if (value.blockUntil && now > value.blockUntil) {
+          global.loginAttempts.delete(key);
+        }
+      }
+    }
+    if (global.contactRateLimit) {
+      const now = Date.now();
+
+      for (const [key, attempts] of global.contactRateLimit.entries()) {
+        const recentAttempts = attempts.filter(
+          (timestamp) => now - timestamp < 3600000,
+        );
+
+        if (recentAttempts.length === 0) {
+          global.contactRateLimit.delete(key);
+        } else {
+          global.contactRateLimit.set(key, recentAttempts);
+        }
+      }
+    }
+  },
+  30 * 60 * 1000,
+);
+
 async function run() {
   try {
-    // // ===== EMAIL CONFIGURATION VALIDATION =====
-    // if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-    //   console.warn(
-    //     "⚠️ Email credentials not configured. OTP emails will not be sent.",
-    //   );
-    //   console.warn("Please set EMAIL_USER and EMAIL_PASS in your .env file");
-    // } else {
-    //   try {
-    //     const testTransporter = nodemailer.createTransport({
-    //       service: "gmail",
-    //       auth: {
-    //         user: process.env.EMAIL_USER,
-    //         pass: process.env.EMAIL_PASS,
-    //       },
-    //     });
-    //     await testTransporter.verify();
-    //     console.log("✅ Email configuration verified");
-    //   } catch (emailError) {
-    //     console.warn("⚠️ Email configuration invalid:", emailError.message);
-    //   }
-    // }
-
     // Connect the client to the server
     await client.connect();
-    console.log("Connected to MongoDB");
+    logger.log("Connected to MongoDB");
 
     const db = client.db("lmsDB");
     const courseCollection = db.collection("courses");
@@ -113,10 +265,20 @@ async function run() {
     const testimonialCollection = db.collection("testimonials");
     const contactCollection = db.collection("contacts");
     const reviewCollection = db.collection("reviews");
+    // ============= Blog Post Collections =============
+    const postCollection = db.collection("posts");
+    const commentCollection = db.collection("comments");
     // ============= ANALYTICS COLLECTIONS =============
     const courseAnalyticsCollection = db.collection("courseAnalytics");
     const userAnalyticsCollection = db.collection("userAnalytics");
     const revenueAnalyticsCollection = db.collection("revenueAnalytics");
+
+    // Index for posts
+    await postCollection.createIndex({ status: 1 });
+    await postCollection.createIndex({ createdAt: -1 });
+    await postCollection.createIndex({ category: 1 });
+    await postCollection.createIndex({ authorId: 1 });
+    await postCollection.createIndex({ status: 1, createdAt: -1 });
 
     // Create indexes
     await courseAnalyticsCollection.createIndex({ courseId: 1 });
@@ -148,7 +310,7 @@ async function run() {
     );
     await userCollection.createIndex({ "notifications.createdAt": -1 });
 
-    console.log("Database indexes created");
+    logger.log("Database indexes created");
 
     await paymentCollection.createIndex(
       { trxID: 1 },
@@ -161,13 +323,13 @@ async function run() {
     await paymentCollection.createIndex({ status: 1 });
     await paymentCollection.createIndex({ userId: 1 });
     await paymentCollection.createIndex({ courseId: 1 });
-    console.log("Payment indexes created");
+    logger.log("Payment indexes created");
 
     // Create indexes for email logs collection
     await emailLogCollection.createIndex({ userId: 1 });
     await emailLogCollection.createIndex({ merchantInvoiceNumber: 1 });
     await emailLogCollection.createIndex({ sentAt: -1 });
-    console.log("✅ Email logs indexes created");
+    logger.log("✅ Email logs indexes created");
 
     // Create indexes for testimonials
     await testimonialCollection.createIndex({ status: 1, isApproved: 1 });
@@ -187,7 +349,7 @@ async function run() {
       try {
         // Check if req.user exists
         if (!req.user) {
-          console.error("❌ isAdmin: No user object in request");
+          logger.error("❌ isAdmin: No user object in request");
           return res.status(401).json({
             success: false,
             message: "Authentication required",
@@ -196,11 +358,11 @@ async function run() {
 
         const userId = req.user.userId;
 
-        console.log("🔍 isAdmin checking userId:", userId);
+        logger.log("🔍 isAdmin checking userId:", userId);
 
         // Validate userId exists
         if (!userId) {
-          console.error("❌ isAdmin: No userId in token");
+          logger.error("❌ isAdmin: No userId in token");
           return res.status(400).json({
             success: false,
             message: "Invalid token: No user ID",
@@ -209,7 +371,7 @@ async function run() {
 
         // Validate userId format
         if (!ObjectId.isValid(userId)) {
-          console.error("❌ isAdmin: Invalid userId format:", userId);
+          logger.error("❌ isAdmin: Invalid userId format:", userId);
           return res.status(400).json({
             success: false,
             message: "Invalid user ID format in token",
@@ -221,7 +383,7 @@ async function run() {
         });
 
         if (!user) {
-          console.error("❌ isAdmin: User not found for ID:", userId);
+          logger.error("❌ isAdmin: User not found for ID:", userId);
           return res.status(404).json({
             success: false,
             message: "User not found",
@@ -229,21 +391,22 @@ async function run() {
         }
 
         if (user.role !== "admin") {
-          console.error("❌ isAdmin: User is not admin. Role:", user.role);
+          logger.error("❌ isAdmin: User is not admin. Role:", user.role);
           return res.status(403).json({
             success: false,
             message: "Admin access required",
           });
         }
 
-        console.log("✅ isAdmin: User authorized as admin:", user.email);
+        logger.log("✅ isAdmin: User authorized as admin:", user.email);
         next();
       } catch (error) {
-        console.error("❌ isAdmin middleware error:", error);
+        logger.error("❌ isAdmin middleware error:", error);
         res.status(500).json({
           success: false,
           message: "Authorization error",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     }
@@ -271,8 +434,71 @@ async function run() {
     }
 
     // ============= HELPER FUNCTIONS =============
-
     // Helper function to generate unique invoice number
+
+    function checkLoginAttempts(ip, email) {
+      const key = `${ip}_${email}`;
+      const attempts = global.loginAttempts.get(key);
+
+      if (!attempts) {
+        return {
+          blocked: false,
+        };
+      }
+
+      const now = Date.now();
+
+      // Remove expired block
+      if (attempts.blockUntil && now > attempts.blockUntil) {
+        global.loginAttempts.delete(key);
+
+        return {
+          blocked: false,
+        };
+      }
+
+      // Still blocked
+      if (attempts.blockUntil && now < attempts.blockUntil) {
+        return {
+          blocked: true,
+          remainingTime: Math.ceil((attempts.blockUntil - now) / 60000),
+        };
+      }
+
+      return {
+        blocked: false,
+      };
+    }
+
+    function recordFailedLogin(ip, email) {
+      const key = `${ip}_${email}`;
+
+      const existing = global.loginAttempts.get(key) || {
+        count: 0,
+        firstAttempt: Date.now(),
+      };
+
+      // Reset attempts after 15 minutes
+      if (Date.now() - existing.firstAttempt > 15 * 60 * 1000) {
+        existing.count = 0;
+        existing.firstAttempt = Date.now();
+      }
+
+      existing.count += 1;
+
+      // Block after 5 failed attempts
+      if (existing.count >= 5) {
+        existing.blockUntil = Date.now() + 15 * 60 * 1000;
+      }
+
+      global.loginAttempts.set(key, existing);
+    }
+
+    function clearLoginAttempts(ip, email) {
+      const key = `${ip}_${email}`;
+      global.loginAttempts.delete(key);
+    }
+
     function generateInvoiceNumber() {
       const timestamp = Date.now().toString();
       const random = Math.floor(Math.random() * 10000)
@@ -329,7 +555,7 @@ async function run() {
 
           return notificationWithId;
         } catch (error) {
-          console.error("Send notification error:", error);
+          logger.error("Send notification error:", error);
         }
       },
 
@@ -350,7 +576,7 @@ async function run() {
 
           return notificationWithId;
         } catch (error) {
-          console.error("Send bulk notifications error:", error);
+          logger.error("Send bulk notifications error:", error);
         }
       },
 
@@ -367,20 +593,84 @@ async function run() {
 
           return await notificationService.sendToMany(studentIds, notification);
         } catch (error) {
-          console.error("Send to course students error:", error);
+          logger.error("Send to course students error:", error);
         }
       },
     };
 
-    app.post("/contact", async (req, res) => {
+    // Generate email verification token
+    function generateEmailVerificationToken(email) {
+      return jwt.sign(
+        { email, purpose: "email_verification" },
+        process.env.JWT_SECRET,
+        { expiresIn: "24h" },
+      );
+    }
+
+    // Send verification email
+    async function sendVerificationEmail(email, name, token) {
+      const verificationUrl = `${process.env.FRONTEND_URL || "http://localhost:5173"}/verify-email?token=${token}`;
+
+      const mailOptions = {
+        from: `"BD Programming" <${process.env.EMAIL_USER}>`,
+        to: email,
+        subject: "Verify Your Email Address - BD Programming",
+        html: `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Verify Your Email</title>
+        <style>
+          body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+          .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+          .header { background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
+          .header h1 { color: white; margin: 0; }
+          .content { background: #f9fafb; padding: 30px; border-radius: 0 0 10px 10px; }
+          .button { display: inline-block; background: #6366f1; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; margin: 20px 0; }
+          .footer { text-align: center; padding: 20px; font-size: 12px; color: #6b7280; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1>Welcome to BD Programming!</h1>
+          </div>
+          <div class="content">
+            <p>Hello <strong>${name}</strong>,</p>
+            <p>Thank you for registering! Please verify your email address to get started.</p>
+            <div style="text-align: center;">
+              <a href="${verificationUrl}" class="button">Verify Email Address</a>
+            </div>
+            <p>Or copy and paste this link:</p>
+            <p style="background: #e5e7eb; padding: 10px; border-radius: 5px; word-break: break-all;">${verificationUrl}</p>
+            <p>This link expires in <strong>24 hours</strong>.</p>
+            <p>If you didn't create an account, please ignore this email.</p>
+          </div>
+          <div class="footer">
+            <p>© ${new Date().getFullYear()} BD Programming. All rights reserved.</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `,
+      };
+
+      return await transporter.sendMail(mailOptions);
+    }
+
+    api.post("/contact", async (req, res) => {
       try {
-        console.log("📝 Contact form submission received:", req.body);
+        logger.log("📝 Contact form submission received:", req.body);
 
-        const { name, email, phone, subject, message } = req.body;
+        const { name, email, phone, subject, message, recaptchaToken } =
+          req.body;
 
+        // ===== 1. VALIDATION =====
         // Validate required fields
         if (!name || !email || !subject || !message) {
           return res.status(400).json({
+            success: false,
             error: "Please fill all required fields",
           });
         }
@@ -388,10 +678,50 @@ async function run() {
         // Validate email format
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
         if (!emailRegex.test(email)) {
-          return res.status(400).json({ error: "Invalid email format" });
+          return res.status(400).json({
+            success: false,
+            error: "Invalid email format",
+          });
         }
 
-        // Use lmsDB (your main database)
+        // ===== 2. RECAPTCHA VERIFICATION (Production only) =====
+        if (process.env.NODE_ENV === "production") {
+          if (!recaptchaToken) {
+            return res.status(400).json({
+              success: false,
+              error: "reCAPTCHA verification required",
+            });
+          }
+
+          const isRecaptchaValid = await verifyRecaptcha(recaptchaToken);
+          if (!isRecaptchaValid) {
+            return res.status(400).json({
+              success: false,
+              error: "reCAPTCHA verification failed. Please try again.",
+            });
+          }
+        }
+
+        // ===== 3. RATE LIMITING (Optional but recommended) =====
+        const ip = req.ip || req.connection.remoteAddress;
+        const rateLimitKey = `contact_${ip}`;
+
+        if (!global.contactRateLimit) global.contactRateLimit = new Map();
+        const now = Date.now();
+        const userAttempts = global.contactRateLimit.get(rateLimitKey) || [];
+        const recentAttempts = userAttempts.filter((t) => now - t < 3600000); // Last hour
+
+        if (recentAttempts.length >= 5) {
+          return res.status(429).json({
+            success: false,
+            error: "Too many messages. Please try again later.",
+          });
+        }
+
+        recentAttempts.push(now);
+        global.contactRateLimit.set(rateLimitKey, recentAttempts);
+
+        // ===== 4. SAVE TO DATABASE =====
         const db = client.db("lmsDB");
         const contacts = db.collection("contacts");
 
@@ -407,62 +737,92 @@ async function run() {
           ip: req.ip || req.connection.remoteAddress,
         };
 
-        console.log("💾 Saving to database:", contactData);
+        logger.log("💾 Saving to database:", contactData);
         const result = await contacts.insertOne(contactData);
-        console.log("✅ Saved with ID:", result.insertedId);
+        logger.log("✅ Saved with ID:", result.insertedId);
 
-        // Send email to user (non-blocking)
-        if (transporter) {
+        // ===== 5. SEND EMAILS (Non-blocking) =====
+        let emailSent = false;
+
+        if (transporter && process.env.EMAIL_USER) {
+          // Send acknowledgment email to user
           transporter
             .sendMail({
-              from: process.env.EMAIL_USER,
+              from: `"BD Programming" <${process.env.EMAIL_USER}>`,
               to: email,
-              subject: "Thank you for contacting LMS",
+              subject: "Thank you for contacting BD Programming",
               html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-            <h2 style="color: #4f46e5;">Thank You for Contacting Us!</h2>
-            <p>Dear ${name},</p>
-            <p>We have received your message and will get back to you within 24-48 hours.</p>
-            <div style="background: #f3f4f6; padding: 20px; border-radius: 8px; margin: 20px 0;">
-              <p><strong>Subject:</strong> ${subject}</p>
-              <p><strong>Message:</strong> ${message}</p>
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <div style="background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
+                <h1 style="color: white; margin: 0;">Thank You for Contacting Us!</h1>
+              </div>
+              <div style="background: #f9fafb; padding: 30px; border-radius: 0 0 10px 10px;">
+                <p>Dear <strong>${name}</strong>,</p>
+                <p>We have received your message and will get back to you within 24-48 hours.</p>
+                <div style="background: #e5e7eb; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                  <p><strong>Subject:</strong> ${subject}</p>
+                  <p><strong>Message:</strong> ${message}</p>
+                </div>
+                <p>In the meantime, you might find answers in our <a href="${process.env.FRONTEND_URL}/faq" style="color: #6366f1;">FAQ section</a>.</p>
+                <p>Best regards,<br><strong>BD Programming Support Team</strong></p>
+              </div>
+              <div style="text-align: center; padding: 20px; font-size: 12px; color: #6b7280;">
+                <p>© ${new Date().getFullYear()} BD Programming. All rights reserved.</p>
+              </div>
             </div>
-            <p>Best regards,<br>LMS Support Team</p>
-          </div>
-        `,
+          `,
             })
-            .catch((err) => console.error("Email error:", err));
+            .then(() => {
+              logger.log("✅ Acknowledgment email sent to user:", email);
+              emailSent = true;
+            })
+            .catch((err) => logger.error("❌ Email error:", err.message));
 
           // Send admin notification
           transporter
             .sendMail({
-              from: process.env.EMAIL_USER,
+              from: `"BD Programming Contact" <${process.env.EMAIL_USER}>`,
               to: process.env.ADMIN_EMAIL || "teams.rcsbd@gmail.com",
-              subject: "New Contact Form Submission",
+              subject: `New Contact Form Submission: ${subject}`,
               html: `
-          <div style="font-family: Arial, sans-serif;">
-            <h2>New Contact Form Submission</h2>
-            <p><strong>Name:</strong> ${name}</p>
-            <p><strong>Email:</strong> ${email}</p>
-            <p><strong>Phone:</strong> ${phone || "Not provided"}</p>
-            <p><strong>Subject:</strong> ${subject}</p>
-            <p><strong>Message:</strong> ${message}</p>
-          </div>
-        `,
+            <div style="font-family: Arial, sans-serif;">
+              <h2 style="color: #6366f1;">New Contact Form Submission</h2>
+              <table style="width: 100%; border-collapse: collapse;">
+                <tr><td style="padding: 8px 0;"><strong>Name:</strong></td><td>${name}</td></tr>
+                <tr><td style="padding: 8px 0;"><strong>Email:</strong></td><td>${email}</td></tr>
+                <tr><td style="padding: 8px 0;"><strong>Phone:</strong></td><td>${phone || "Not provided"}</td></tr>
+                <tr><td style="padding: 8px 0;"><strong>Subject:</strong></td><td>${subject}</td></tr>
+                <tr><td style="padding: 8px 0;"><strong>Message:</strong></td><td>${message}</td></tr>
+                <tr><td style="padding: 8px 0;"><strong>IP:</strong></td><td>${req.ip || "Not available"}</td></tr>
+                <tr><td style="padding: 8px 0;"><strong>Time:</strong></td><td>${new Date().toLocaleString()}</td></tr>
+              </table>
+              <div style="margin-top: 20px;">
+                <a href="${process.env.FRONTEND_URL}/admin/contacts/${result.insertedId}" style="background: #6366f1; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">View in Admin Panel</a>
+              </div>
+            </div>
+          `,
             })
-            .catch((err) => console.error("Admin email error:", err));
+            .then(() => logger.log("✅ Admin notification email sent"))
+            .catch((err) => logger.error("❌ Admin email error:", err.message));
+        } else {
+          logger.warn(
+            "⚠️ Email transporter not configured. Skipping email notifications.",
+          );
         }
 
+        // ===== 6. SUCCESS RESPONSE =====
         res.status(201).json({
           success: true,
-          message: "Contact form submitted successfully",
+          message:
+            "Your message has been sent successfully! We'll get back to you within 24-48 hours.",
           contactId: result.insertedId,
+          emailSent: emailSent,
         });
       } catch (error) {
-        console.error("❌ Contact form error:", error);
+        logger.error("❌ Contact form error:", error);
         res.status(500).json({
-          error: "Failed to submit contact form",
-          details: error.message,
+          success: false,
+          error: "Failed to submit contact form. Please try again later.",
         });
       }
     });
@@ -543,17 +903,17 @@ async function run() {
 
     // 7. GET user statistics for dashboard (FIXED WITH ERROR HANDLING)
     // ============= FIXED USER STATS ROUTE =============
-    app.get(
+    api.get(
       "/admin/users/stats",
       authenticateToken,
       isAdmin,
       async (req, res) => {
         try {
-          console.log("📊 Fetching user statistics...");
+          logger.log("📊 Fetching user statistics...");
 
           // Verify userCollection exists
           if (!userCollection) {
-            console.error("❌ userCollection is not defined!");
+            logger.error("❌ userCollection is not defined!");
             return res.status(500).json({
               success: false,
               message: "Database collection not initialized",
@@ -562,7 +922,7 @@ async function run() {
 
           // Get total users count
           const totalUsers = await userCollection.countDocuments();
-          console.log(`✅ Total users found: ${totalUsers}`);
+          logger.log(`✅ Total users found: ${totalUsers}`);
 
           // Get counts by status
           let activeUsers = 0,
@@ -582,7 +942,7 @@ async function run() {
               (await userCollection.countDocuments({ status: "inactive" })) ||
               0;
           } catch (statusError) {
-            console.log("⚠️ Status field may not exist, using defaults");
+            logger.log("⚠️ Status field may not exist, using defaults");
             activeUsers = totalUsers;
           }
 
@@ -600,7 +960,7 @@ async function run() {
             studentCount =
               (await userCollection.countDocuments({ role: "student" })) || 0;
           } catch (roleError) {
-            console.log("⚠️ Role field may not exist");
+            logger.log("⚠️ Role field may not exist");
           }
 
           const stats = {
@@ -616,25 +976,28 @@ async function run() {
             ],
           };
 
-          console.log("✅ Stats calculated:", stats);
+          logger.log("✅ Stats calculated:", stats);
 
           res.json({
             success: true,
             stats: stats,
           });
         } catch (error) {
-          console.error("❌ Get user stats error:", error);
+          logger.error("❌ Get user stats error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to fetch user statistics",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // ============= GET ALL USERS WITH STATS =============
-    app.get("/admin/users", authenticateToken, isAdmin, async (req, res) => {
+    api.get("/admin/users", authenticateToken, isAdmin, async (req, res) => {
       try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 10;
@@ -653,7 +1016,7 @@ async function run() {
           ];
         }
 
-        console.log("🔍 Fetching users with query:", JSON.stringify(query));
+        logger.log("🔍 Fetching users with query:", JSON.stringify(query));
 
         // Get total count for pagination
         const total = await userCollection.countDocuments(query);
@@ -672,7 +1035,7 @@ async function run() {
           .limit(limit)
           .toArray();
 
-        console.log(`✅ Found ${users.length} users`);
+        logger.log(`✅ Found ${users.length} users`);
 
         // Get enrollment and payment stats for each user
         const usersWithStats = await Promise.all(
@@ -699,7 +1062,7 @@ async function run() {
                   status: "COMPLETED",
                 })) || 0;
             } catch (e) {
-              console.log(
+              logger.log(
                 `No payment collection or no payments for user ${user._id}`,
               );
             }
@@ -726,17 +1089,18 @@ async function run() {
           },
         });
       } catch (error) {
-        console.error("❌ Get users error:", error);
+        logger.error("❌ Get users error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch users",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // 6. BULK user operations
-    app.post(
+    api.post(
       "/admin/users/bulk-action",
       authenticateToken,
       isAdmin,
@@ -800,7 +1164,7 @@ async function run() {
             modifiedCount: result.modifiedCount,
           });
         } catch (error) {
-          console.error("Bulk action error:", error);
+          logger.error("Bulk action error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to perform bulk action",
@@ -810,7 +1174,7 @@ async function run() {
     );
 
     // ============= ADD EMAIL LOGS ROUTE (Admin only) =============
-    app.get("/admin/email-logs", authenticateToken, async (req, res) => {
+    api.get("/admin/email-logs", authenticateToken, async (req, res) => {
       try {
         // Check if user is admin
         const user = await userCollection.findOne({
@@ -846,7 +1210,7 @@ async function run() {
           },
         });
       } catch (error) {
-        console.error("Get email logs error:", error);
+        logger.error("Get email logs error:", error);
         res
           .status(500)
           .json({ success: false, message: "Failed to get email logs" });
@@ -855,7 +1219,7 @@ async function run() {
 
     // ============= ADMIN USER MANAGEMENT ROUTES =============
     // 2. GET single user details with full info
-    app.get(
+    api.get(
       "/admin/users/:userId",
       authenticateToken,
       isAdmin,
@@ -863,11 +1227,11 @@ async function run() {
         try {
           const { userId } = req.params;
 
-          console.log("🔍 Fetching user details for ID:", userId);
+          logger.log("🔍 Fetching user details for ID:", userId);
 
           // Validate if userId is a valid ObjectId
           if (!ObjectId.isValid(userId)) {
-            console.log("❌ Invalid user ID format:", userId);
+            logger.log("❌ Invalid user ID format:", userId);
             return res.status(400).json({
               success: false,
               message: "Invalid user ID format",
@@ -915,18 +1279,21 @@ async function run() {
             },
           });
         } catch (error) {
-          console.error("Get user details error:", error);
+          logger.error("Get user details error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to fetch user details",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // 3. UPDATE user role
-    app.put(
+    api.put(
       "/admin/users/:userId/role",
       authenticateToken,
       isAdmin,
@@ -960,7 +1327,7 @@ async function run() {
           }
 
           // Log the action
-          console.log(
+          logger.log(
             `User ${userId} role changed to ${role} by admin ${req.user.userId}`,
           );
 
@@ -969,7 +1336,7 @@ async function run() {
             message: "User role updated successfully",
           });
         } catch (error) {
-          console.error("Update user role error:", error);
+          logger.error("Update user role error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to update user role",
@@ -979,7 +1346,7 @@ async function run() {
     );
 
     // 4. UPDATE user status (active/suspended/blocked)
-    app.put(
+    api.put(
       "/admin/users/:userId/status",
       authenticateToken,
       isAdmin,
@@ -1020,7 +1387,7 @@ async function run() {
             message: `User ${status} successfully`,
           });
         } catch (error) {
-          console.error("Update user status error:", error);
+          logger.error("Update user status error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to update user status",
@@ -1030,7 +1397,7 @@ async function run() {
     );
 
     // 5. DELETE user (cascade delete)
-    app.delete(
+    api.delete(
       "/admin/users/:userId",
       authenticateToken,
       isAdmin,
@@ -1073,12 +1440,12 @@ async function run() {
                 { session },
               );
 
-              console.log(
+              logger.log(
                 `User ${userId} and all related data deleted by admin ${req.user.userId}`,
               );
             });
 
-            await session.commitTransaction();
+            // await session.commitTransaction();
 
             res.json({
               success: true,
@@ -1088,7 +1455,7 @@ async function run() {
             await session.endSession();
           }
         } catch (error) {
-          console.error("Delete user error:", error);
+          logger.error("Delete user error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to delete user",
@@ -1097,58 +1464,208 @@ async function run() {
       },
     );
 
+    // Get user's testimonials (for profile page)
+    api.get(
+      "/users/:userId/testimonials",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const { userId } = req.params;
+          const requestingUserId = req.user.userId;
+
+          logger.log("📝 Fetching testimonials for userId:", userId);
+          logger.log("🔐 Requesting userId:", requestingUserId);
+
+          // Users can only see their own testimonials (or admin can see all)
+          if (userId !== requestingUserId && req.user.role !== "admin") {
+            logger.log("❌ Unauthorized access attempt");
+            return res.status(403).json({
+              success: false,
+              message: "Unauthorized to view these testimonials",
+            });
+          }
+
+          // Find testimonials for this user
+          const testimonials = await testimonialCollection
+            .find({ userId: new ObjectId(userId) })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+          logger.log(
+            `✅ Found ${testimonials.length} testimonials for user ${userId}`,
+          );
+          logger.log(
+            "📊 Testimonials data:",
+            JSON.stringify(testimonials, null, 2),
+          );
+
+          res.json({
+            success: true,
+            testimonials: testimonials,
+            count: testimonials.length,
+          });
+        } catch (error) {
+          logger.error("❌ Get user testimonials error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to fetch testimonials",
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
+          });
+        }
+      },
+    );
+
     // ============= AUTH ROUTES =============
     // Register new user
-    app.post("/auth/register", async (req, res) => {
+    // ============= PRODUCTION READY REGISTRATION ENDPOINT =============
+
+    api.post("/register", async (req, res) => {
       try {
-        const { name, email, password, role = "student" } = req.body;
+        const {
+          name,
+          email,
+          password,
+          // role = "student",
+          recaptchaToken,
+        } = req.body;
 
-        // Check if user exists
-        const existingUser = await userCollection.findOne({ email });
+        logger.log("📝 Registration attempt for:", email);
+
+        // ===== 1. INPUT VALIDATION =====
+        if (!name || !email || !password) {
+          return res.status(400).json({
+            success: false,
+            message: "Name, email, and password are required",
+          });
+        }
+
+        // Email format validation
+        const emailRegex = /^[^\s@]+@([^\s@.,]+\.)+[^\s@.,]{2,}$/;
+        if (!emailRegex.test(email)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid email format",
+          });
+        }
+
+        // Block disposable email domains
+        const domain = email.split("@")[1];
+        const disposableDomains = [
+          "tempmail.com",
+          "throwaway.com",
+          "mailinator.com",
+          "10minutemail.com",
+          "guerrillamail.com",
+          "sharklasers.com",
+        ];
+        if (disposableDomains.includes(domain)) {
+          return res.status(400).json({
+            success: false,
+            message: "Please use a permanent email address",
+          });
+        }
+
+        // ===== 2. PASSWORD VALIDATION (Consistent with frontend) =====
+        const passwordErrors = [];
+        if (password.length < 8) passwordErrors.push("at least 8 characters");
+        if (!/[A-Z]/.test(password)) passwordErrors.push("an uppercase letter");
+        if (!/[a-z]/.test(password)) passwordErrors.push("a lowercase letter");
+        if (!/[0-9]/.test(password)) passwordErrors.push("a number");
+        if (!/[!@#$%^&*]/.test(password))
+          passwordErrors.push("a special character (!@#$%^&*)");
+
+        if (passwordErrors.length > 0) {
+          return res.status(400).json({
+            success: false,
+            message: `Password must contain: ${passwordErrors.join(", ")}`,
+          });
+        }
+
+        // ===== 3. RATE LIMITING (IP-based) =====
+        const ip = req.ip || req.connection.remoteAddress;
+        const rateLimitKey = `register_${ip}`;
+
+        // Simple in-memory rate limiting (use Redis in production)
+        if (!global.rateLimitStore) global.rateLimitStore = new Map();
+        const now = Date.now();
+        const userAttempts = global.rateLimitStore.get(rateLimitKey) || [];
+        const recentAttempts = userAttempts.filter((t) => now - t < 3600000); // Last hour
+
+        if (recentAttempts.length >= 5) {
+          return res.status(429).json({
+            success: false,
+            message: "Too many registration attempts. Please try again later.",
+          });
+        }
+
+        recentAttempts.push(now);
+        global.rateLimitStore.set(rateLimitKey, recentAttempts);
+
+        // ===== 4. CHECK PWNED PASSWORDS =====
+        const isPwned = await isPasswordPwned(password);
+        if (isPwned) {
+          return res.status(400).json({
+            success: false,
+            message:
+              "This password has been exposed in data breaches. Please choose a different password.",
+          });
+        }
+
+        // ===== 5. RECAPTCHA VERIFICATION (Required in production) =====
+        if (process.env.NODE_ENV === "production") {
+          if (!recaptchaToken) {
+            return res.status(400).json({
+              success: false,
+              message: "reCAPTCHA verification required",
+            });
+          }
+
+          const isRecaptchaValid = await verifyRecaptcha(recaptchaToken);
+          if (!isRecaptchaValid) {
+            return res.status(400).json({
+              success: false,
+              message: "reCAPTCHA verification failed. Please try again.",
+            });
+          }
+        }
+
+        // ===== 6. CHECK IF USER EXISTS (Security: Don't reveal email existence) =====
+        const existingUser = await userCollection.findOne({
+          email: email.toLowerCase(),
+        });
         if (existingUser) {
-          return res
-            .status(400)
-            .json({ success: false, message: "Email already exists" });
-        }
-
-        // ===== PASSWORD STRENGTH VALIDATION =====
-        if (password.length < 6) {
+          // Return generic message for security
           return res.status(400).json({
             success: false,
-            message: "Password must be at least 6 characters long",
+            message: "Unable to create account. Please check your information.",
           });
         }
 
-        // Optional: Add more complex password requirements
-        if (!/[A-Z]/.test(password)) {
-          return res.status(400).json({
-            success: false,
-            message: "Password must contain at least one uppercase letter",
-          });
-        }
-
-        if (!/[0-9]/.test(password)) {
-          return res.status(400).json({
-            success: false,
-            message: "Password must contain at least one number",
-          });
-        }
-
-        // Hash password
-        const hashedPassword = await bcrypt.hash(password, 10);
-
-        // Generate unique ID
+        // ===== 7. CREATE USER =====
+        const hashedPassword = await bcrypt.hash(password, 12); // Increased cost factor
         const uniqueId = await generateUniqueStudentId();
+
+        // Sanitize name (XSS protection)
+        const sanitizedName = name.trim().replace(/[<>]/g, "").slice(0, 100);
+
+        // Generate verification token
+        const verificationToken = generateEmailVerificationToken(email);
 
         const userData = {
           uniqueId,
-          name,
-          email,
+          name: sanitizedName,
+          email: email.toLowerCase().trim(),
           password: hashedPassword,
-          role,
+          role: "student",
+          isEmailVerified: false,
+          emailVerificationToken: verificationToken,
+          emailVerificationExpires: new Date(Date.now() + 24 * 60 * 60 * 1000),
           profile: {
-            photo: "",
             phone: "",
+            bio: "",
             address: {
               street: "",
               city: "",
@@ -1162,101 +1679,399 @@ async function run() {
               yearOfPassing: "",
               specialization: "",
             },
-            bio: "",
-            socialLinks: {
-              github: "",
-              linkedin: "",
-              twitter: "",
-            },
+            socialLinks: { github: "", linkedin: "", twitter: "" },
           },
           enrolledCourses: [],
           wishlist: [],
           notifications: [],
           settings: {
-            emailNotifications: true,
-            twoFactorAuth: false,
-            language: "en",
+            profile: {
+              name: sanitizedName,
+              email: email.toLowerCase(),
+              phone: "",
+              bio: "",
+              language: "en",
+              timezone: "UTC",
+            },
+            notifications: {
+              emailNotifications: true,
+              pushNotifications: true,
+              courseUpdates: true,
+              newLessons: true,
+              achievements: true,
+              newsletters: false,
+              marketingEmails: false,
+            },
+            privacy: {
+              profileVisibility: "public",
+              showProgress: true,
+              showCertificates: true,
+              allowMessages: true,
+            },
+            security: {
+              twoFactorAuth: false,
+              loginAlerts: true,
+              sessionTimeout: 30,
+            },
+            appearance: {
+              theme: "light",
+              compactMode: false,
+              fontSize: "medium",
+              reducedMotion: false,
+            },
           },
           createdAt: new Date(),
           updatedAt: new Date(),
-          lastLogin: new Date(),
+          lastLogin: null,
+          status: "pending_verification",
         };
 
         const result = await userCollection.insertOne(userData);
 
-        // Create JWT token
-        const token = jwt.sign(
-          { userId: result.insertedId, email, role },
-          process.env.JWT_SECRET,
-          { expiresIn: "7d" },
-        );
+        // ===== 8. SEND VERIFICATION EMAIL =====
+        try {
+          await sendVerificationEmail(email, sanitizedName, verificationToken);
+          logger.log("✅ Verification email sent to:", email);
+        } catch (emailError) {
+          logger.error("❌ Failed to send verification email:", emailError);
+          // Don't fail registration, but log error
+        }
 
+        // ===== 9. AUDIT LOG =====
+        logger.log(`✅ User registered: ${email} (ID: ${result.insertedId})`);
+
+        // ===== 10. RESPONSE (No auto-login, requires verification) =====
         res.status(201).json({
           success: true,
-          message: "User registered successfully",
-          token,
-          user: { ...userData, _id: result.insertedId, password: undefined },
+          message:
+            "Registration successful! Please check your email to verify your account.",
+          requiresVerification: true,
+          email: userData.email,
         });
       } catch (error) {
-        console.error("Register error:", error);
+        logger.error("❌ Registration error:", error);
         res.status(500).json({
           success: false,
-          message: "Registration failed",
-          error: error.message,
+          message: "Registration failed. Please try again later.",
+        });
+      }
+    });
+
+    // verify-email endpoint:
+
+    api.get("/verify-email", async (req, res) => {
+      try {
+        const { token } = req.query;
+
+        logger.log("📧 Email verification request received");
+
+        // ===== 1. VALIDATE TOKEN EXISTENCE =====
+        if (!token) {
+          return res.status(400).json({
+            success: false,
+            message: "Verification token required",
+          });
+        }
+
+        // ===== 2. VERIFY JWT TOKEN =====
+        let decoded;
+
+        try {
+          decoded = jwt.verify(token, process.env.JWT_SECRET);
+        } catch (err) {
+          logger.warn("❌ Invalid verification token");
+
+          return res.status(400).json({
+            success: false,
+            message: "Invalid or expired verification token",
+          });
+        }
+
+        // ===== 3. VALIDATE TOKEN PURPOSE =====
+        if (decoded.purpose !== "email_verification") {
+          logger.warn("❌ Invalid token purpose");
+
+          return res.status(400).json({
+            success: false,
+            message: "Invalid token type",
+          });
+        }
+
+        const email = decoded.email.toLowerCase().trim();
+
+        logger.log("✅ Verification token validated");
+
+        // ===== 4. FIND USER =====
+        const user = await userCollection.findOne({
+          email,
+          emailVerificationToken: token,
+          emailVerificationExpires: {
+            $gt: new Date(),
+          },
+        });
+
+        if (!user) {
+          logger.warn(
+            "❌ Verification failed: user not found or token expired",
+          );
+
+          return res.status(400).json({
+            success: false,
+            message: "Invalid or expired verification token",
+          });
+        }
+
+        // ===== 5. PREVENT DOUBLE VERIFICATION =====
+        if (user.isEmailVerified) {
+          return res.status(400).json({
+            success: false,
+            message: "Email already verified",
+          });
+        }
+
+        // ===== 6. UPDATE USER =====
+        await userCollection.updateOne(
+          { _id: user._id },
+          {
+            $set: {
+              isEmailVerified: true,
+              status: "active",
+              emailVerifiedAt: new Date(),
+              updatedAt: new Date(),
+            },
+            $unset: {
+              emailVerificationToken: "",
+              emailVerificationExpires: "",
+            },
+          },
+        );
+
+        logger.log("✅ Email verified successfully");
+
+        // ===== 7. SUCCESS RESPONSE =====
+        res.status(200).json({
+          success: true,
+          message: "Email verified successfully! You can now log in.",
+        });
+      } catch (error) {
+        logger.error("❌ Email verification error:", error);
+
+        res.status(500).json({
+          success: false,
+          message: "Server error during verification",
+        });
+      }
+    });
+
+    // Add this endpoint after your registration endpoint
+    api.post("/resend-verification", async (req, res) => {
+      try {
+        const { email } = req.body;
+
+        logger.log("📧 Resend verification requested for:", email);
+
+        if (!email) {
+          return res.status(400).json({
+            success: false,
+            message: "Email is required",
+          });
+        }
+
+        // Find user
+        const user = await userCollection.findOne({
+          email: email.toLowerCase(),
+        });
+
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            message: "User not found",
+          });
+        }
+
+        // Check if already verified
+        if (user.isEmailVerified) {
+          return res.status(400).json({
+            success: false,
+            message: "Email already verified",
+          });
+        }
+
+        // Rate limiting for resend (prevent spam)
+        const lastSent = user.lastVerificationSent;
+        if (lastSent) {
+          const minutesSinceLastSent =
+            (Date.now() - new Date(lastSent)) / 60000;
+          if (minutesSinceLastSent < 5) {
+            return res.status(429).json({
+              success: false,
+              message: `Please wait ${Math.ceil(5 - minutesSinceLastSent)} minutes before requesting another email`,
+              retryAfter: Math.ceil(5 - minutesSinceLastSent),
+            });
+          }
+        }
+
+        // Generate new verification token
+        const verificationToken = generateEmailVerificationToken(email);
+
+        // Send verification email
+        await sendVerificationEmail(email, user.name, verificationToken);
+
+        // Update user with new token
+        await userCollection.updateOne(
+          { _id: user._id },
+          {
+            $set: {
+              emailVerificationToken: verificationToken,
+              emailVerificationExpires: new Date(
+                Date.now() + 24 * 60 * 60 * 1000,
+              ),
+              lastVerificationSent: new Date(),
+            },
+          },
+        );
+
+        logger.log("✅ Verification email resent to:", email);
+
+        res.json({
+          success: true,
+          message: "Verification email sent successfully",
+        });
+      } catch (error) {
+        logger.error("❌ Resend verification error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to send verification email",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // Login
-    app.post("/auth/login", async (req, res) => {
+    // ============= UPDATED LOGIN ENDPOINT (With verification check) =============
+
+    api.post("/login", async (req, res) => {
       try {
         const { email, password } = req.body;
 
-        const user = await userCollection.findOne({ email });
-        if (!user) {
-          return res
-            .status(401)
-            .json({ success: false, message: "Invalid credentials" });
+        const ip = req.ip || req.connection.remoteAddress;
+
+        // Validate input first
+        if (!email || !password) {
+          return res.status(400).json({
+            success: false,
+            message: "Email and password are required",
+          });
         }
 
-        const isValidPassword = await bcrypt.compare(password, user.password);
-        if (!isValidPassword) {
-          return res
-            .status(401)
-            .json({ success: false, message: "Invalid credentials" });
+        // Normalize email
+        const normalizedEmail = email.toLowerCase().trim();
+
+        // Check brute-force protection
+        const loginCheck = checkLoginAttempts(ip, normalizedEmail);
+
+        if (loginCheck.blocked) {
+          return res.status(429).json({
+            success: false,
+            message: `Too many failed login attempts. Try again in ${loginCheck.remainingTime} minutes.`,
+          });
         }
+
+        // Find user
+        const user = await userCollection.findOne({
+          email: normalizedEmail,
+        });
+
+        // User not found
+        if (!user) {
+          recordFailedLogin(ip, normalizedEmail);
+
+          return res.status(401).json({
+            success: false,
+            message: "Invalid credentials",
+          });
+        }
+
+        // Check if email verified
+        if (!user.isEmailVerified) {
+          return res.status(403).json({
+            success: false,
+            message: "Please verify your email before logging in",
+            requiresVerification: true,
+            email: user.email,
+          });
+        }
+
+        // Check account status
+        if (user.status === "blocked" || user.status === "suspended") {
+          return res.status(403).json({
+            success: false,
+            message: "Your account has been suspended. Please contact support.",
+          });
+        }
+
+        // Verify password
+        const isValidPassword = await bcrypt.compare(password, user.password);
+
+        if (!isValidPassword) {
+          recordFailedLogin(ip, normalizedEmail);
+
+          return res.status(401).json({
+            success: false,
+            message: "Invalid credentials",
+          });
+        }
+
+        // Clear failed attempts after successful login
+        clearLoginAttempts(ip, normalizedEmail);
 
         // Update last login
         await userCollection.updateOne(
           { _id: user._id },
-          { $set: { lastLogin: new Date() } },
+          {
+            $set: {
+              lastLogin: new Date(),
+            },
+          },
         );
 
+        // Generate JWT
         const token = jwt.sign(
-          { userId: user._id, email: user.email, role: user.role },
+          {
+            userId: user._id,
+            email: user.email,
+            role: user.role,
+            isVerified: user.isEmailVerified,
+          },
           process.env.JWT_SECRET,
-          { expiresIn: "7d" },
+          {
+            expiresIn: "7d",
+          },
         );
+
+        // Remove password from response
+        const { password: _, ...userWithoutPassword } = user;
 
         res.json({
           success: true,
           message: "Login successful",
           token,
-          user: { ...user, password: undefined },
+          user: userWithoutPassword,
         });
       } catch (error) {
-        console.error("Login error:", error);
+        logger.error("Login error:", error);
+
         res.status(500).json({
           success: false,
-          message: "Login failed",
-          error: error.message,
+          message: "Login failed. Please try again.",
         });
       }
     });
 
     // ============= PASSWORD RESET WITH OTP =============
     // Request OTP for password reset
-    app.post("/auth/forgot-password", async (req, res) => {
+    api.post("/forgot-password", async (req, res) => {
       try {
         const { email } = req.body;
 
@@ -1298,7 +2113,7 @@ async function run() {
           <p>This OTP will expire in 10 minutes.</p>
           <p>If you didn't request this, please ignore this email.</p>
           <hr style="border: 1px solid #e5e7eb; margin: 20px 0;">
-          <p style="color: #6b7280; font-size: 12px;">LMS Academy - Your Learning Partner</p>
+          <p style="color: #6b7280; font-size: 12px;">BD Programming - Your Learning Partner</p>
         </div>
       `,
         };
@@ -1311,17 +2126,18 @@ async function run() {
           expiresIn: 600, // seconds
         });
       } catch (error) {
-        console.error("Forgot password error:", error);
+        logger.error("Forgot password error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to send OTP",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // Verify OTP
-    app.post("/auth/verify-otp", async (req, res) => {
+    api.post("/verify-otp", async (req, res) => {
       try {
         const { email, otp } = req.body;
 
@@ -1358,70 +2174,137 @@ async function run() {
           token: resetToken,
         });
       } catch (error) {
-        console.error("Verify OTP error:", error);
+        logger.error("Verify OTP error:", error);
         res.status(500).json({
           success: false,
           message: "OTP verification failed",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // Reset password
-    app.post("/auth/reset-password", async (req, res) => {
+    api.post("/reset-password", async (req, res) => {
       try {
         const { token, newPassword } = req.body;
 
-        // ===== PASSWORD STRENGTH VALIDATION =====
-        if (newPassword.length < 6) {
+        // ===== 1. VALIDATE INPUT =====
+        if (!token || !newPassword) {
           return res.status(400).json({
             success: false,
-            message: "Password must be at least 6 characters long",
+            message: "Token and new password are required",
           });
         }
 
-        // Verify token
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        if (!decoded || decoded.purpose !== "password_reset") {
-          return res
-            .status(401)
-            .json({ success: false, message: "Invalid or expired token" });
+        // ===== 2. PASSWORD VALIDATION =====
+        const passwordErrors = [];
+
+        if (newPassword.length < 8) {
+          passwordErrors.push("at least 8 characters");
         }
 
-        const hashedPassword = await bcrypt.hash(newPassword, 10);
+        if (!/[A-Z]/.test(newPassword)) {
+          passwordErrors.push("an uppercase letter");
+        }
 
+        if (!/[a-z]/.test(newPassword)) {
+          passwordErrors.push("a lowercase letter");
+        }
+
+        if (!/[0-9]/.test(newPassword)) {
+          passwordErrors.push("a number");
+        }
+
+        if (!/[!@#$%^&*]/.test(newPassword)) {
+          passwordErrors.push("a special character (!@#$%^&*)");
+        }
+
+        if (passwordErrors.length > 0) {
+          return res.status(400).json({
+            success: false,
+            message: `Password must contain: ${passwordErrors.join(", ")}`,
+          });
+        }
+
+        // ===== 3. CHECK PWNED PASSWORDS =====
+        const isPwned = await isPasswordPwned(newPassword);
+
+        if (isPwned) {
+          return res.status(400).json({
+            success: false,
+            message:
+              "This password has been exposed in data breaches. Please choose a different password.",
+          });
+        }
+
+        // ===== 4. VERIFY TOKEN =====
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+        if (!decoded || decoded.purpose !== "password_reset") {
+          return res.status(401).json({
+            success: false,
+            message: "Invalid or expired token",
+          });
+        }
+
+        // ===== 5. HASH PASSWORD =====
+        const hashedPassword = await bcrypt.hash(newPassword, 12);
+
+        // ===== 6. UPDATE PASSWORD =====
         await userCollection.updateOne(
           { email: decoded.email },
-          { $set: { password: hashedPassword, updatedAt: new Date() } },
+          {
+            $set: {
+              password: hashedPassword,
+              updatedAt: new Date(),
+            },
+          },
         );
 
-        // Clear used OTPs
+        // ===== 7. CLEAR USED OTPs =====
         await otpCollection.deleteMany({
           email: decoded.email,
           purpose: "password_reset",
         });
 
+        logger.log(`✅ Password reset successful for: ${decoded.email}`);
+
+        // ===== 8. SUCCESS RESPONSE =====
         res.json({
           success: true,
           message: "Password reset successfully",
         });
       } catch (error) {
-        console.error("Reset password error:", error);
+        logger.error("Reset password error:", error);
+
+        // Handle JWT expiration specifically
+        if (
+          error.name === "TokenExpiredError" ||
+          error.name === "JsonWebTokenError"
+        ) {
+          return res.status(401).json({
+            success: false,
+            message: "Invalid or expired reset token",
+          });
+        }
+
         res.status(500).json({
           success: false,
           message: "Failed to reset password",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // ============= USER PROFILE ROUTES =============
     // Get user profile
-    app.get("/users/profile", authenticateToken, async (req, res) => {
+    api.get("/users/profile", authenticateToken, async (req, res) => {
       try {
         const userId = req.user.userId;
 
-        console.log("📋 Fetching profile for user:", userId);
+        logger.log("📋 Fetching profile for user:", userId);
 
         // Validate userId
         if (!ObjectId.isValid(userId)) {
@@ -1450,7 +2333,7 @@ async function run() {
           });
         }
 
-        console.log("✅ Profile fetched successfully for:", user.email);
+        logger.log("✅ Profile fetched successfully for:", user.email);
 
         res.json({
           success: true,
@@ -1470,17 +2353,18 @@ async function run() {
           },
         });
       } catch (error) {
-        console.error("❌ Get profile error:", error);
+        logger.error("❌ Get profile error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch profile",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // Update user profile
-    app.put("/users/profile", authenticateToken, async (req, res) => {
+    api.put("/users/profile", authenticateToken, async (req, res) => {
       try {
         const { name, profile } = req.body;
 
@@ -1500,11 +2384,12 @@ async function run() {
           message: "Profile updated successfully",
         });
       } catch (error) {
-        console.error("Update profile error:", error);
+        logger.error("Update profile error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to update profile",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
@@ -1530,43 +2415,42 @@ async function run() {
     }
 
     // In your enrollment route (when student enrolls)
-    app.post(
-      "/api/users/enroll/:courseId",
-      authenticateToken,
-      async (req, res) => {
-        try {
-          const { courseId } = req.params;
-          const userId = req.user.userId;
+    api.post("/users/enroll/:courseId", authenticateToken, async (req, res) => {
+      try {
+        const { courseId } = req.params;
+        const userId = req.user.userId;
 
-          // ... existing enrollment code ...
+        // ... existing enrollment code ...
 
-          // AFTER successful enrollment, update course stats
-          await courseCollection.updateOne(
-            { _id: new ObjectId(courseId) },
-            { $inc: { "stats.totalStudents": 1 } },
+        // AFTER successful enrollment, update course stats
+        await courseCollection.updateOne(
+          { _id: new ObjectId(courseId) },
+          { $inc: { "stats.totalStudents": 1 } },
+        );
+
+        // Also update instructor's studentsTaught count
+        const course = await courseCollection.findOne({
+          _id: new ObjectId(courseId),
+        });
+        if (course.instructor?._id) {
+          await userCollection.updateOne(
+            { _id: course.instructor._id },
+            { $inc: { studentsTaught: 1 } },
           );
-
-          // Also update instructor's studentsTaught count
-          const course = await courseCollection.findOne({
-            _id: new ObjectId(courseId),
-          });
-          if (course.instructor?._id) {
-            await userCollection.updateOne(
-              { _id: course.instructor._id },
-              { $inc: { studentsTaught: 1 } },
-            );
-          }
-
-          res.json({ success: true, message: "Enrolled successfully" });
-        } catch (error) {
-          console.error("Enrollment error:", error);
-          res.status(500).json({ error: error.message });
         }
-      },
-    );
+
+        res.json({ success: true, message: "Enrolled successfully" });
+      } catch (error) {
+        logger.error("Enrollment error:", error);
+        res.status(500).json({
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
+      }
+    });
 
     // Update course progress
-    app.post(
+    api.post(
       "/users/progress/:courseId",
       authenticateToken,
       async (req, res) => {
@@ -1657,18 +2541,21 @@ async function run() {
             progress: progressPercentage,
           });
         } catch (error) {
-          console.error("Progress update error:", error);
+          logger.error("Progress update error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to update progress",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // Get user's enrolled courses with progress
-    app.get("/users/my-courses", authenticateToken, async (req, res) => {
+    api.get("/users/my-courses", authenticateToken, async (req, res) => {
       try {
         const user = await userCollection.findOne(
           { _id: new ObjectId(req.user.userId) },
@@ -1713,17 +2600,18 @@ async function run() {
           courses: validCourses,
         });
       } catch (error) {
-        console.error("Get my courses error:", error);
+        logger.error("Get my courses error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch courses",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // Get user's certificates
-    app.get("/users/certificates", authenticateToken, async (req, res) => {
+    api.get("/users/certificates", authenticateToken, async (req, res) => {
       try {
         const certificates = await certificateCollection
           .find({ userId: new ObjectId(req.user.userId) })
@@ -1735,17 +2623,18 @@ async function run() {
           certificates,
         });
       } catch (error) {
-        console.error("Get certificates error:", error);
+        logger.error("Get certificates error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch certificates",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // Verify certificate
-    app.get("/certificates/verify/:certificateId", async (req, res) => {
+    api.get("/certificates/verify/:certificateId", async (req, res) => {
       try {
         const { certificateId } = req.params;
 
@@ -1770,17 +2659,18 @@ async function run() {
           },
         });
       } catch (error) {
-        console.error("Verify certificate error:", error);
+        logger.error("Verify certificate error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to verify certificate",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // Add to wishlist
-    app.post(
+    api.post(
       "/users/wishlist/:courseId",
       authenticateToken,
       async (req, res) => {
@@ -1809,18 +2699,21 @@ async function run() {
             message: "Course added to wishlist",
           });
         } catch (error) {
-          console.error("Wishlist error:", error);
+          logger.error("Wishlist error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to add to wishlist",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // Remove from wishlist
-    app.delete(
+    api.delete(
       "/users/wishlist/:courseId",
       authenticateToken,
       async (req, res) => {
@@ -1838,18 +2731,21 @@ async function run() {
             message: "Course removed from wishlist",
           });
         } catch (error) {
-          console.error("Remove wishlist error:", error);
+          logger.error("Remove wishlist error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to remove from wishlist",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // Get wishlist
-    app.get("/users/wishlist", authenticateToken, async (req, res) => {
+    api.get("/users/wishlist", authenticateToken, async (req, res) => {
       try {
         const user = await userCollection.findOne(
           { _id: new ObjectId(req.user.userId) },
@@ -1865,17 +2761,18 @@ async function run() {
           wishlist: wishlistCourses,
         });
       } catch (error) {
-        console.error("Get wishlist error:", error);
+        logger.error("Get wishlist error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch wishlist",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // Check if course is in wishlist
-    app.get(
+    api.get(
       "/users/wishlist/check/:courseId",
       authenticateToken,
       async (req, res) => {
@@ -1893,18 +2790,21 @@ async function run() {
             isInWishlist: !!user,
           });
         } catch (error) {
-          console.error("Check wishlist error:", error);
+          logger.error("Check wishlist error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to check wishlist",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // Get user notifications (OPTIMIZED)
-    app.get("/users/notifications", authenticateToken, async (req, res) => {
+    api.get("/users/notifications", authenticateToken, async (req, res) => {
       try {
         const userId = req.user.userId;
 
@@ -1924,17 +2824,18 @@ async function run() {
           notifications: notifications,
         });
       } catch (error) {
-        console.error("Get notifications error:", error);
+        logger.error("Get notifications error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch notifications",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // Mark notification as read
-    app.put(
+    api.put(
       "/users/notifications/:notificationId/read",
       authenticateToken,
       async (req, res) => {
@@ -1955,18 +2856,21 @@ async function run() {
             message: "Notification marked as read",
           });
         } catch (error) {
-          console.error("Mark notification error:", error);
+          logger.error("Mark notification error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to mark notification",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // Delete single notification
-    app.delete(
+    api.delete(
       "/users/notifications/:notificationId",
       authenticateToken,
       async (req, res) => {
@@ -1984,7 +2888,7 @@ async function run() {
             message: "Notification deleted successfully",
           });
         } catch (error) {
-          console.error("Delete notification error:", error);
+          logger.error("Delete notification error:", error);
           res
             .status(500)
             .json({ success: false, message: "Failed to delete notification" });
@@ -1993,7 +2897,7 @@ async function run() {
     );
 
     // Clear all notifications
-    app.delete("/users/notifications", authenticateToken, async (req, res) => {
+    api.delete("/users/notifications", authenticateToken, async (req, res) => {
       try {
         const userId = req.user.userId;
 
@@ -2007,7 +2911,7 @@ async function run() {
           message: "All notifications cleared",
         });
       } catch (error) {
-        console.error("Clear notifications error:", error);
+        logger.error("Clear notifications error:", error);
         res
           .status(500)
           .json({ success: false, message: "Failed to clear notifications" });
@@ -2015,7 +2919,7 @@ async function run() {
     });
 
     // Update user settings
-    app.put("/users/settings", authenticateToken, async (req, res) => {
+    api.put("/users/settings", authenticateToken, async (req, res) => {
       try {
         const { settings } = req.body;
         const userId = req.user.userId;
@@ -2030,17 +2934,18 @@ async function run() {
           message: "Settings updated successfully",
         });
       } catch (error) {
-        console.error("Update settings error:", error);
+        logger.error("Update settings error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to update settings",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // Change password (requires authentication)
-    app.post("/auth/change-password", authenticateToken, async (req, res) => {
+    api.post("/change-password", authenticateToken, async (req, res) => {
       try {
         const { currentPassword, newPassword } = req.body;
         const userId = req.user.userId;
@@ -2094,24 +2999,25 @@ async function run() {
           message: "Password changed successfully",
         });
       } catch (error) {
-        console.error("Change password error:", error);
+        logger.error("Change password error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to change password",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // ============= COURSE ROUTES =============
 
-    app.get("/", (req, res) => {
+    api.get("/", (req, res) => {
       res.send(`LMS Training server is running on port ${PORT}`);
     });
 
     // GET all courses
     // READ all courses with filters
-    app.get("/courses", async (req, res) => {
+    api.get("/courses", async (req, res) => {
       try {
         const {
           page = 1,
@@ -2159,17 +3065,18 @@ async function run() {
           },
         });
       } catch (error) {
-        console.error("Get courses error:", error);
+        logger.error("Get courses error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch courses",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // READ single course by ID or slug
-    app.get("/courses/:identifier", async (req, res) => {
+    api.get("/courses/:identifier", async (req, res) => {
       try {
         const { identifier } = req.params;
 
@@ -2237,17 +3144,18 @@ async function run() {
           course: completeCourse,
         });
       } catch (error) {
-        console.error("Get course error:", error);
+        logger.error("Get course error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch course",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // GET course by slug with all data
-    app.get("/courses/:slug", async (req, res) => {
+    api.get("/courses/:slug", async (req, res) => {
       try {
         const { slug } = req.params;
 
@@ -2356,17 +3264,18 @@ async function run() {
           course: completeCourse,
         });
       } catch (error) {
-        console.error("Error fetching course:", error);
+        logger.error("Error fetching course:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch course",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // GET single course by ID
-    app.get("/courses/id/:id", async (req, res) => {
+    api.get("/courses/id/:id", async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -2393,18 +3302,19 @@ async function run() {
           course,
         });
       } catch (error) {
-        console.error("Get course by ID error:", error);
+        logger.error("Get course by ID error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch course",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // POST create new course
     // CREATE course (Admin/Instructor only)
-    app.post("/courses", authenticateToken, async (req, res) => {
+    api.post("/courses", authenticateToken, async (req, res) => {
       try {
         const user = await userCollection.findOne({
           _id: new ObjectId(req.user.userId),
@@ -2460,115 +3370,18 @@ async function run() {
           course: { ...courseData, _id: result.insertedId },
         });
       } catch (error) {
-        console.error("Create course error:", error);
+        logger.error("Create course error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to create course",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
-    // PUT update course
-    // app.put("/courses/:id", async (req, res) => {
-    //   try {
-    //     const { id } = req.params;
-    //     const {
-    //       title,
-    //       description,
-    //       price,
-    //       level,
-    //       duration,
-    //       thumbnail,
-    //       status,
-    //     } = req.body;
-
-    //     console.log("Updating course with identifier:", id);
-
-    //     // Find the course
-    //     let course;
-    //     if (ObjectId.isValid(id)) {
-    //       course = await courseCollection.findOne({ _id: new ObjectId(id) });
-    //     }
-    //     if (!course) {
-    //       course = await courseCollection.findOne({ slug: id });
-    //     }
-
-    //     if (!course) {
-    //       return res.status(404).json({
-    //         success: false,
-    //         message: "Course not found",
-    //       });
-    //     }
-
-    //     const updateData = {
-    //       ...(title && { title }),
-    //       ...(description && { description }),
-    //       ...(price && { price: parseFloat(price) }),
-    //       ...(level && { level }),
-    //       ...(duration && { duration }),
-    //       ...(thumbnail && { thumbnail }),
-    //       ...(status && { status }),
-    //       updatedAt: new Date(),
-    //     };
-
-    //     // Handle slug update only if title changed
-    //     if (title && title !== course.title) {
-    //       const newSlug = generateSlug(title);
-
-    //       // Check if slug exists for a DIFFERENT course
-    //       const existingCourse = await courseCollection.findOne({
-    //         slug: newSlug,
-    //         _id: { $ne: course._id },
-    //       });
-
-    //       if (existingCourse) {
-    //         // Make slug unique
-    //         let counter = 1;
-    //         let uniqueSlug = `${newSlug}-${counter}`;
-
-    //         while (
-    //           await courseCollection.findOne({
-    //             slug: uniqueSlug,
-    //             _id: { $ne: course._id },
-    //           })
-    //         ) {
-    //           counter++;
-    //           uniqueSlug = `${newSlug}-${counter}`;
-    //         }
-
-    //         updateData.slug = uniqueSlug;
-    //         console.log(`Generated unique slug: ${uniqueSlug}`);
-    //       } else {
-    //         updateData.slug = newSlug;
-    //         console.log(`Using new slug: ${newSlug}`);
-    //       }
-    //     }
-
-    //     const result = await courseCollection.updateOne(
-    //       { _id: course._id },
-    //       { $set: updateData },
-    //     );
-
-    //     console.log("Update result:", result);
-
-    //     res.status(200).json({
-    //       success: true,
-    //       message: "Course updated successfully",
-    //       slug: updateData.slug || course.slug, // Return the new slug if changed
-    //     });
-    //   } catch (error) {
-    //     console.error("Update course error:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       message: "Failed to update course",
-    //       error: error.message,
-    //     });
-    //   }
-    // });
-
     // UPDATE course (Admin/Instructor only)
-    app.patch("/courses/:id", authenticateToken, async (req, res) => {
+    api.patch("/courses/:id", authenticateToken, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -2636,16 +3449,17 @@ async function run() {
           modifiedCount: result.modifiedCount,
         });
       } catch (error) {
-        console.error("Update course error:", error);
+        logger.error("Update course error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to update course",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
     // GET featured reviews
-    app.get("/courses/:courseId/reviews/featured", async (req, res) => {
+    api.get("/courses/:courseId/reviews/featured", async (req, res) => {
       try {
         const { courseId } = req.params;
 
@@ -2666,7 +3480,7 @@ async function run() {
           reviews: featuredReviews,
         });
       } catch (error) {
-        console.error("Error fetching reviews:", error);
+        logger.error("Error fetching reviews:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch reviews",
@@ -2675,7 +3489,7 @@ async function run() {
     });
 
     // GET related courses
-    app.get("/courses/:courseId/related", async (req, res) => {
+    api.get("/courses/:courseId/related", async (req, res) => {
       try {
         const { courseId } = req.params;
 
@@ -2713,7 +3527,7 @@ async function run() {
           courses: relatedCourses,
         });
       } catch (error) {
-        console.error("Error fetching related courses:", error);
+        logger.error("Error fetching related courses:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch related courses",
@@ -2722,7 +3536,7 @@ async function run() {
     });
     // DELETE course
     // DELETE course (Admin only)
-    app.delete("/courses/:id", authenticateToken, isAdmin, async (req, res) => {
+    api.delete("/courses/:id", authenticateToken, isAdmin, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -2819,16 +3633,17 @@ async function run() {
           await session.endSession();
         }
       } catch (error) {
-        console.error("Delete course error:", error);
+        logger.error("Delete course error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to delete course",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
     // BULK operations on courses (Admin only)
-    app.post("/courses/bulk", authenticateToken, isAdmin, async (req, res) => {
+    api.post("/courses/bulk", authenticateToken, isAdmin, async (req, res) => {
       try {
         const { action, courseIds, data } = req.body;
 
@@ -2947,21 +3762,22 @@ async function run() {
           modifiedCount: result.modifiedCount || result.deletedCount,
         });
       } catch (error) {
-        console.error("Bulk action error:", error);
+        logger.error("Bulk action error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to perform bulk action",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // ============= CHAPTER ROUTES =============
     // GET chapters by course ID (using course _id)
-    app.get("/courses/:courseId/chapters", async (req, res) => {
+    api.get("/courses/:courseId/chapters", async (req, res) => {
       try {
         const { courseId } = req.params;
-        console.log("Fetching chapters for course identifier:", courseId);
+        logger.log("Fetching chapters for course identifier:", courseId);
 
         let course;
         const courseCollection = db.collection("courses");
@@ -2986,7 +3802,7 @@ async function run() {
           });
         }
 
-        console.log("Found course:", course.title, "with _id:", course._id);
+        logger.log("Found course:", course.title, "with _id:", course._id);
 
         // Find chapters using the course's _id
         const chapters = await db
@@ -2995,16 +3811,20 @@ async function run() {
           .sort({ order: 1 })
           .toArray();
 
-        console.log(`Found ${chapters.length} chapters`);
+        logger.log(`Found ${chapters.length} chapters`);
         res.json({ success: true, chapters });
       } catch (error) {
-        console.error("Get chapters error:", error);
-        res.status(500).json({ success: false, error: error.message });
+        logger.error("Get chapters error:", error);
+        res.status(500).json({
+          success: false,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
     // GET single chapter by ID
-    app.get("/chapters/:chapterId", async (req, res) => {
+    api.get("/chapters/:chapterId", async (req, res) => {
       try {
         const { chapterId } = req.params;
 
@@ -3029,17 +3849,18 @@ async function run() {
           chapter,
         });
       } catch (error) {
-        console.error("Get chapter error:", error);
+        logger.error("Get chapter error:", error);
         res.status(500).json({
           success: false,
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // POST create new chapter
     // CREATE chapter
-    app.post("/chapters", authenticateToken, async (req, res) => {
+    api.post("/chapters", authenticateToken, async (req, res) => {
       try {
         const { courseId, title, description, order } = req.body;
 
@@ -3095,17 +3916,18 @@ async function run() {
           chapter: { ...chapterData, _id: result.insertedId },
         });
       } catch (error) {
-        console.error("Create chapter error:", error);
+        logger.error("Create chapter error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to create chapter",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // PUT update chapter
-    app.put("/chapters/:chapterId", async (req, res) => {
+    api.put("/chapters/:chapterId", async (req, res) => {
       try {
         const { chapterId } = req.params;
         const { title, description, order } = req.body;
@@ -3141,147 +3963,18 @@ async function run() {
           message: "Chapter updated successfully",
         });
       } catch (error) {
-        console.error("Update chapter error:", error);
+        logger.error("Update chapter error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to update chapter",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
-    // UPDATE chapter
-    // app.patch("/chapters/:id", authenticateToken, async (req, res) => {
-    //   try {
-    //     const { id } = req.params;
-
-    //     if (!ObjectId.isValid(id)) {
-    //       return res.status(400).json({
-    //         success: false,
-    //         message: "Invalid chapter ID",
-    //       });
-    //     }
-
-    //     const chapter = await chapterCollection.findOne({
-    //       _id: new ObjectId(id),
-    //     });
-
-    //     if (!chapter) {
-    //       return res.status(404).json({
-    //         success: false,
-    //         message: "Chapter not found",
-    //       });
-    //     }
-
-    //     // Check permissions
-    //     const user = await userCollection.findOne({
-    //       _id: new ObjectId(req.user.userId),
-    //     });
-    //     const course = await courseCollection.findOne({
-    //       _id: chapter.courseId,
-    //     });
-
-    //     if (
-    //       user.role !== "admin" &&
-    //       course?.instructor?._id?.toString() !== user._id.toString()
-    //     ) {
-    //       return res.status(403).json({
-    //         success: false,
-    //         message: "Unauthorized to update this chapter",
-    //       });
-    //     }
-
-    //     const result = await chapterCollection.updateOne(
-    //       { _id: new ObjectId(id) },
-    //       {
-    //         $set: {
-    //           ...req.body,
-    //           updatedAt: new Date(),
-    //         },
-    //       },
-    //     );
-
-    //     res.json({
-    //       success: true,
-    //       message: "Chapter updated successfully",
-    //       modifiedCount: result.modifiedCount,
-    //     });
-    //   } catch (error) {
-    //     console.error("Update chapter error:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       message: "Failed to update chapter",
-    //       error: error.message,
-    //     });
-    //   }
-    // });
-
     // DELETE chapter
-    // app.delete("/chapters/:chapterId", async (req, res) => {
-    //   try {
-    //     const { chapterId } = req.params;
-
-    //     // Validate ID
-    //     if (!ObjectId.isValid(chapterId)) {
-    //       return res.status(400).json({
-    //         success: false,
-    //         message: "Invalid chapter ID format",
-    //       });
-    //     }
-
-    //     // Get chapter to find courseId
-    //     const chapter = await db.collection("chapters").findOne({
-    //       _id: new ObjectId(chapterId),
-    //     });
-
-    //     if (!chapter) {
-    //       return res.status(404).json({
-    //         success: false,
-    //         message: "Chapter not found",
-    //       });
-    //     }
-
-    //     // Delete all lessons and topics in this chapter first
-    //     const lessons = await db
-    //       .collection("lessons")
-    //       .find({ chapterId: chapter._id })
-    //       .toArray();
-
-    //     for (const lesson of lessons) {
-    //       await db.collection("topics").deleteMany({ lessonId: lesson._id });
-    //     }
-
-    //     await db.collection("lessons").deleteMany({ chapterId: chapter._id });
-
-    //     // Delete the chapter
-    //     const result = await db.collection("chapters").deleteOne({
-    //       _id: new ObjectId(chapterId),
-    //     });
-
-    //     // Update course's totalChapters count
-    //     await db
-    //       .collection("courses")
-    //       .updateOne(
-    //         { _id: chapter.courseId },
-    //         { $inc: { totalChapters: -1 } },
-    //       );
-
-    //     res.json({
-    //       success: true,
-    //       message: "Chapter and all its contents deleted successfully",
-    //     });
-    //   } catch (error) {
-    //     console.error("Delete chapter error:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       message: "Failed to delete chapter",
-    //       error: error.message,
-    //     });
-    //   }
-    // });
-
-    // DELETE chapter
-    app.delete("/chapters/:id", authenticateToken, async (req, res) => {
+    api.delete("/chapters/:id", authenticateToken, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -3351,17 +4044,18 @@ async function run() {
           message: "Chapter and all its content deleted successfully",
         });
       } catch (error) {
-        console.error("Delete chapter error:", error);
+        logger.error("Delete chapter error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to delete chapter",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // POST reorder chapters
-    app.post("/chapters/reorder", async (req, res) => {
+    api.post("/chapters/reorder", async (req, res) => {
       try {
         const { chapters } = req.body;
 
@@ -3387,21 +4081,22 @@ async function run() {
           message: "Chapters reordered successfully",
         });
       } catch (error) {
-        console.error("Reorder chapters error:", error);
+        logger.error("Reorder chapters error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to reorder chapters",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // ============= LESSON ROUTES =============
     // GET lessons by chapter ID
-    app.get("/chapters/:chapterId/lessons", async (req, res) => {
+    api.get("/chapters/:chapterId/lessons", async (req, res) => {
       try {
         const { chapterId } = req.params;
-        console.log("Fetching lessons for chapter:", chapterId);
+        logger.log("Fetching lessons for chapter:", chapterId);
 
         let query;
         if (ObjectId.isValid(chapterId)) {
@@ -3433,16 +4128,20 @@ async function run() {
           .sort({ order: 1 })
           .toArray();
 
-        console.log(`Found ${lessons.length} lessons`);
+        logger.log(`Found ${lessons.length} lessons`);
         res.json({ success: true, lessons });
       } catch (error) {
-        console.error("Get lessons error:", error);
-        res.status(500).json({ success: false, error: error.message });
+        logger.error("Get lessons error:", error);
+        res.status(500).json({
+          success: false,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
     // GET all lessons (with optional filtering)
-    app.get("/lessons", async (req, res) => {
+    api.get("/lessons", async (req, res) => {
       try {
         const { chapterId } = req.query;
         let query = {};
@@ -3468,19 +4167,23 @@ async function run() {
           .sort({ order: 1 })
           .toArray();
 
-        console.log(`Found ${lessons.length} lessons`);
+        logger.log(`Found ${lessons.length} lessons`);
         res.json({ success: true, lessons });
       } catch (error) {
-        console.error("Get all lessons error:", error);
-        res.status(500).json({ success: false, error: error.message });
+        logger.error("Get all lessons error:", error);
+        res.status(500).json({
+          success: false,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
     // GET single lesson with its topics
-    app.get("/lessons/:lessonId", async (req, res) => {
+    api.get("/lessons/:lessonId", async (req, res) => {
       try {
         const { lessonId } = req.params;
-        console.log("Fetching lesson with topics:", lessonId);
+        logger.log("Fetching lesson with topics:", lessonId);
 
         let lessonQuery;
         if (ObjectId.isValid(lessonId)) {
@@ -3510,104 +4213,20 @@ async function run() {
           .sort({ order: 1 })
           .toArray();
 
-        console.log(`Found ${topics.length} topics for lesson`);
+        logger.log(`Found ${topics.length} topics for lesson`);
         res.json({ success: true, lesson, topics });
       } catch (error) {
-        console.error("Get lesson error:", error);
-        res.status(500).json({ success: false, error: error.message });
+        logger.error("Get lesson error:", error);
+        res.status(500).json({
+          success: false,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
       }
     });
 
-    // POST create new lesson (UPDATED WITH NOTIFICATION)
-    // app.post("/lessons", async (req, res) => {
-    //   try {
-    //     const { chapterId, title, description, order } = req.body;
-
-    //     // Validate required fields
-    //     if (!chapterId || !title) {
-    //       return res.status(400).json({
-    //         success: false,
-    //         message: "Chapter ID and title are required",
-    //       });
-    //     }
-
-    //     // Verify chapter exists
-    //     let chapterQuery;
-    //     if (ObjectId.isValid(chapterId)) {
-    //       chapterQuery = { _id: new ObjectId(chapterId) };
-    //     } else {
-    //       chapterQuery = { _id: chapterId };
-    //     }
-
-    //     const chapter = await db.collection("chapters").findOne(chapterQuery);
-    //     if (!chapter) {
-    //       return res.status(404).json({
-    //         success: false,
-    //         message: "Chapter not found",
-    //       });
-    //     }
-
-    //     // Get the highest order number for this chapter
-    //     const lastLesson = await db
-    //       .collection("lessons")
-    //       .find({ chapterId: chapter._id })
-    //       .sort({ order: -1 })
-    //       .limit(1)
-    //       .toArray();
-
-    //     const nextOrder = lastLesson.length > 0 ? lastLesson[0].order + 1 : 1;
-
-    //     const lessonData = {
-    //       chapterId: chapter._id,
-    //       title,
-    //       description: description || "",
-    //       order: order || nextOrder,
-    //       totalTopics: 0,
-    //       completed: false,
-    //       createdAt: new Date(),
-    //       updatedAt: new Date(),
-    //     };
-
-    //     const result = await db.collection("lessons").insertOne(lessonData);
-
-    //     // Update chapter's totalLessons count
-    //     await db
-    //       .collection("chapters")
-    //       .updateOne({ _id: chapter._id }, { $inc: { totalLessons: 1 } });
-
-    //     // Update course's totalLessons count
-    //     await db
-    //       .collection("courses")
-    //       .updateOne({ _id: chapter.courseId }, { $inc: { totalLessons: 1 } });
-
-    //     // ===== ADD NOTIFICATION TO ALL ENROLLED STUDENTS =====
-    //     const course = await courseCollection.findOne({
-    //       _id: chapter.courseId,
-    //     });
-    //     await notificationService.sendToCourseStudents(chapter.courseId, {
-    //       type: "course",
-    //       message: `📚 New lesson available: '${title}'`,
-    //       details: `Check out the new content in ${course.title}`,
-    //       actionUrl: `/course/${course.slug || chapter.courseId}`,
-    //     });
-
-    //     res.status(201).json({
-    //       success: true,
-    //       message: "Lesson created successfully",
-    //       lesson: { ...lessonData, _id: result.insertedId },
-    //     });
-    //   } catch (error) {
-    //     console.error("Create lesson error:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       message: "Failed to create lesson",
-    //       error: error.message,
-    //     });
-    //   }
-    // });
-
     // CREATE lesson
-    app.post("/lessons", authenticateToken, async (req, res) => {
+    api.post("/lessons", authenticateToken, async (req, res) => {
       try {
         const { chapterId, title, description, type, duration, order } =
           req.body;
@@ -3678,17 +4297,18 @@ async function run() {
           lesson: { ...lessonData, _id: result.insertedId },
         });
       } catch (error) {
-        console.error("Create lesson error:", error);
+        logger.error("Create lesson error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to create lesson",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // PUT update lesson
-    app.put("/lessons/:lessonId", async (req, res) => {
+    api.put("/lessons/:lessonId", async (req, res) => {
       try {
         const { lessonId } = req.params;
         const { title, description, order } = req.body;
@@ -3729,148 +4349,18 @@ async function run() {
           message: "Lesson updated successfully",
         });
       } catch (error) {
-        console.error("Update lesson error:", error);
+        logger.error("Update lesson error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to update lesson",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
-    // UPDATE lesson
-    // app.patch("/lessons/:id", authenticateToken, async (req, res) => {
-    //   try {
-    //     const { id } = req.params;
-
-    //     if (!ObjectId.isValid(id)) {
-    //       return res.status(400).json({
-    //         success: false,
-    //         message: "Invalid lesson ID",
-    //       });
-    //     }
-
-    //     const lesson = await lessonCollection.findOne({
-    //       _id: new ObjectId(id),
-    //     });
-
-    //     if (!lesson) {
-    //       return res.status(404).json({
-    //         success: false,
-    //         message: "Lesson not found",
-    //       });
-    //     }
-
-    //     // Check permissions
-    //     const user = await userCollection.findOne({
-    //       _id: new ObjectId(req.user.userId),
-    //     });
-    //     const course = await courseCollection.findOne({ _id: lesson.courseId });
-
-    //     if (
-    //       user.role !== "admin" &&
-    //       course?.instructor?._id?.toString() !== user._id.toString()
-    //     ) {
-    //       return res.status(403).json({
-    //         success: false,
-    //         message: "Unauthorized to update this lesson",
-    //       });
-    //     }
-
-    //     const result = await lessonCollection.updateOne(
-    //       { _id: new ObjectId(id) },
-    //       {
-    //         $set: {
-    //           ...req.body,
-    //           updatedAt: new Date(),
-    //         },
-    //       },
-    //     );
-
-    //     res.json({
-    //       success: true,
-    //       message: "Lesson updated successfully",
-    //       modifiedCount: result.modifiedCount,
-    //     });
-    //   } catch (error) {
-    //     console.error("Update lesson error:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       message: "Failed to update lesson",
-    //       error: error.message,
-    //     });
-    //   }
-    // });
-
     // DELETE lesson
-    // app.delete("/lessons/:lessonId", async (req, res) => {
-    //   try {
-    //     const { lessonId } = req.params;
-
-    //     // Validate ID
-    //     if (!ObjectId.isValid(lessonId)) {
-    //       return res.status(400).json({
-    //         success: false,
-    //         message: "Invalid lesson ID format",
-    //       });
-    //     }
-
-    //     // Get lesson to find chapterId
-    //     const lesson = await db.collection("lessons").findOne({
-    //       _id: new ObjectId(lessonId),
-    //     });
-
-    //     if (!lesson) {
-    //       return res.status(404).json({
-    //         success: false,
-    //         message: "Lesson not found",
-    //       });
-    //     }
-
-    //     // Get chapter to find courseId
-    //     const chapter = await db.collection("chapters").findOne({
-    //       _id: lesson.chapterId,
-    //     });
-
-    //     // Delete all topics in this lesson
-    //     await db.collection("topics").deleteMany({ lessonId: lesson._id });
-
-    //     // Delete the lesson
-    //     const result = await db.collection("lessons").deleteOne({
-    //       _id: new ObjectId(lessonId),
-    //     });
-
-    //     // Update chapter's totalLessons count
-    //     await db
-    //       .collection("chapters")
-    //       .updateOne({ _id: lesson.chapterId }, { $inc: { totalLessons: -1 } });
-
-    //     // Update course's totalLessons count
-    //     if (chapter) {
-    //       await db
-    //         .collection("courses")
-    //         .updateOne(
-    //           { _id: chapter.courseId },
-    //           { $inc: { totalLessons: -1 } },
-    //         );
-    //     }
-
-    //     res.json({
-    //       success: true,
-    //       message: "Lesson and all its topics deleted successfully",
-    //     });
-    //   } catch (error) {
-    //     console.error("Delete lesson error:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       message: "Failed to delete lesson",
-    //       error: error.message,
-    //     });
-    //   }
-    // });
-
-    // DELETE lesson
-    app.delete("/lessons/:id", authenticateToken, async (req, res) => {
+    api.delete("/lessons/:id", authenticateToken, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -3937,17 +4427,18 @@ async function run() {
           message: "Lesson and all its topics deleted successfully",
         });
       } catch (error) {
-        console.error("Delete lesson error:", error);
+        logger.error("Delete lesson error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to delete lesson",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // POST reorder lessons
-    app.post("/lessons/reorder", async (req, res) => {
+    api.post("/lessons/reorder", async (req, res) => {
       try {
         const { lessons } = req.body;
 
@@ -3973,21 +4464,22 @@ async function run() {
           message: "Lessons reordered successfully",
         });
       } catch (error) {
-        console.error("Reorder lessons error:", error);
+        logger.error("Reorder lessons error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to reorder lessons",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // ============= TOPIC ROUTES =============
     // GET all topics for a lesson
-    app.get("/lessons/:lessonId/topics", async (req, res) => {
+    api.get("/lessons/:lessonId/topics", async (req, res) => {
       try {
         const { lessonId } = req.params;
-        console.log("Fetching topics for lesson:", lessonId);
+        logger.log("Fetching topics for lesson:", lessonId);
 
         let query;
         if (ObjectId.isValid(lessonId)) {
@@ -4002,10 +4494,10 @@ async function run() {
           .sort({ order: 1 })
           .toArray();
 
-        console.log(`Found ${topics.length} topics`);
+        logger.log(`Found ${topics.length} topics`);
         res.json({ success: true, topics });
       } catch (error) {
-        console.error("Get topics error:", error);
+        logger.error("Get topics error:", error);
         res.status(500).json({ success: false, error: error.message });
       }
     });
@@ -4013,7 +4505,7 @@ async function run() {
     // ==================== TOPIC APIs ====================
 
     // CREATE topic with blocks (including code blocks with highlighting)
-    app.post(
+    api.post(
       "/lessons/:lessonId/topics",
       authenticateToken,
       async (req, res) => {
@@ -4129,18 +4621,21 @@ async function run() {
             topic: { ...newTopic, _id: result.insertedId },
           });
         } catch (error) {
-          console.error("Create topic error:", error);
+          logger.error("Create topic error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to create topic",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // GET single topic by ID
-    app.get("/lessons/:lessonId/topics/:topicId", async (req, res) => {
+    api.get("/lessons/:lessonId/topics/:topicId", async (req, res) => {
       try {
         const { lessonId, topicId } = req.params;
 
@@ -4165,17 +4660,18 @@ async function run() {
 
         res.json({ success: true, topic });
       } catch (error) {
-        console.error("Get topic error:", error);
+        logger.error("Get topic error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to get topic",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // UPDATE topic
-    app.put(
+    api.put(
       "/lessons/:lessonId/topics/:topicId",
       authenticateToken,
       async (req, res) => {
@@ -4245,18 +4741,21 @@ async function run() {
             message: "Topic updated successfully",
           });
         } catch (error) {
-          console.error("Update topic error:", error);
+          logger.error("Update topic error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to update topic",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // DELETE topic
-    app.delete(
+    api.delete(
       "/lessons/:lessonId/topics/:topicId",
       authenticateToken,
       async (req, res) => {
@@ -4320,11 +4819,14 @@ async function run() {
             message: "Topic deleted successfully",
           });
         } catch (error) {
-          console.error("Delete topic error:", error);
+          logger.error("Delete topic error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to delete topic",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
@@ -4333,7 +4835,7 @@ async function run() {
     // ==================== BLOCK APIs (with Code Block Highlighting) ====================
 
     // ADD block to topic
-    app.post(
+    api.post(
       "/lessons/:lessonId/topics/:topicId/blocks",
       authenticateToken,
       async (req, res) => {
@@ -4413,18 +4915,21 @@ async function run() {
             block: newBlock,
           });
         } catch (error) {
-          console.error("Add block error:", error);
+          logger.error("Add block error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to add block",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // GET all blocks for a topic
-    app.get("/lessons/:lessonId/topics/:topicId/blocks", async (req, res) => {
+    api.get("/lessons/:lessonId/topics/:topicId/blocks", async (req, res) => {
       try {
         const { lessonId, topicId } = req.params;
 
@@ -4455,17 +4960,18 @@ async function run() {
           blocks: topic.blocks || [],
         });
       } catch (error) {
-        console.error("Get blocks error:", error);
+        logger.error("Get blocks error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to get blocks",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // GET single block
-    app.get(
+    api.get(
       "/lessons/:lessonId/topics/:topicId/blocks/:blockId",
       async (req, res) => {
         try {
@@ -4499,18 +5005,21 @@ async function run() {
             block: topic.blocks[0],
           });
         } catch (error) {
-          console.error("Get block error:", error);
+          logger.error("Get block error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to get block",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // UPDATE block (with support for code block highlighting)
-    app.put(
+    api.put(
       "/lessons/:lessonId/topics/:topicId/blocks/:blockId",
       authenticateToken,
       async (req, res) => {
@@ -4609,18 +5118,21 @@ async function run() {
             message: "Block updated successfully",
           });
         } catch (error) {
-          console.error("Update block error:", error);
+          logger.error("Update block error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to update block",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // DELETE block
-    app.delete(
+    api.delete(
       "/lessons/:lessonId/topics/:topicId/blocks/:blockId",
       authenticateToken,
       async (req, res) => {
@@ -4679,11 +5191,14 @@ async function run() {
             message: "Block deleted successfully",
           });
         } catch (error) {
-          console.error("Delete block error:", error);
+          logger.error("Delete block error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to delete block",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
@@ -4692,7 +5207,7 @@ async function run() {
     // ==================== CODE BLOCK SPECIFIC APIs ====================
 
     // UPDATE highlighted lines for code block
-    app.patch(
+    api.patch(
       "/lessons/:lessonId/topics/:topicId/blocks/:blockId/highlights",
       authenticateToken,
       async (req, res) => {
@@ -4785,18 +5300,21 @@ async function run() {
             modified: result.modifiedCount,
           });
         } catch (error) {
-          console.error("Update highlights error:", error);
+          logger.error("Update highlights error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to update highlights",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // GET highlighted lines for code block
-    app.get(
+    api.get(
       "/lessons/:lessonId/topics/:topicId/blocks/:blockId/highlights",
       async (req, res) => {
         try {
@@ -4841,11 +5359,14 @@ async function run() {
             showLineNumbers: block.showLineNumbers !== false,
           });
         } catch (error) {
-          console.error("Get highlights error:", error);
+          logger.error("Get highlights error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to get highlights",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
@@ -4854,7 +5375,7 @@ async function run() {
     // ==================== SEARCH APIs ====================
 
     // Search across lessons and topics (with code block content)
-    app.get("/search", async (req, res) => {
+    api.get("/search", async (req, res) => {
       try {
         const { q, type, limit = 20 } = req.query;
 
@@ -4931,11 +5452,12 @@ async function run() {
           total: lessons.length + topics.length + codeBlocks.length,
         });
       } catch (error) {
-        console.error("Search error:", error);
+        logger.error("Search error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to search",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
@@ -4943,7 +5465,7 @@ async function run() {
     // ==================== ANALYTICS APIs ====================
 
     // Get code block analytics
-    app.get("/analytics/code-blocks", async (req, res) => {
+    api.get("/analytics/code-blocks", async (req, res) => {
       try {
         const stats = await topicCollection
           .aggregate([
@@ -5022,17 +5544,18 @@ async function run() {
           topHighlighted,
         });
       } catch (error) {
-        console.error("Analytics error:", error);
+        logger.error("Analytics error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to get analytics",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // Get lesson-specific code block analytics
-    app.get("/lessons/:lessonId/analytics/code-blocks", async (req, res) => {
+    api.get("/lessons/:lessonId/analytics/code-blocks", async (req, res) => {
       try {
         const { lessonId } = req.params;
 
@@ -5072,17 +5595,18 @@ async function run() {
           },
         });
       } catch (error) {
-        console.error("Lesson analytics error:", error);
+        logger.error("Lesson analytics error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to get lesson analytics",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // GET single topic by ID
-    app.get("/topics/:topicId", async (req, res) => {
+    api.get("/topics/:topicId", async (req, res) => {
       try {
         const { topicId } = req.params;
 
@@ -5104,94 +5628,13 @@ async function run() {
 
         res.json({ success: true, topic });
       } catch (error) {
-        console.error("Get topic error:", error);
+        logger.error("Get topic error:", error);
         res.status(500).json({ success: false, error: error.message });
       }
     });
 
-    // POST create new topic
-    // app.post("/topics", async (req, res) => {
-    //   try {
-    //     const { lessonId, title, content, order } = req.body;
-
-    //     // Validate required fields
-    //     if (!lessonId || !title) {
-    //       return res.status(400).json({
-    //         success: false,
-    //         message: "Lesson ID and title are required",
-    //       });
-    //     }
-
-    //     // Verify lesson exists
-    //     if (!ObjectId.isValid(lessonId)) {
-    //       return res
-    //         .status(400)
-    //         .json({ success: false, message: "Invalid lesson ID format" });
-    //     }
-
-    //     const lesson = await db.collection("lessons").findOne({
-    //       _id: new ObjectId(lessonId),
-    //     });
-
-    //     if (!lesson) {
-    //       return res
-    //         .status(404)
-    //         .json({ success: false, message: "Lesson not found" });
-    //     }
-
-    //     // Get the highest order number for this lesson
-    //     const lastTopic = await db
-    //       .collection("topics")
-    //       .find({ lessonId: new ObjectId(lessonId) })
-    //       .sort({ order: -1 })
-    //       .limit(1)
-    //       .toArray();
-
-    //     const nextOrder = lastTopic.length > 0 ? lastTopic[0].order + 1 : 1;
-
-    //     const topicData = {
-    //       lessonId: new ObjectId(lessonId),
-    //       title,
-    //       content: content || {
-    //         description: "",
-    //         contentBlocks: [],
-    //         duration: "",
-    //         readingTime: "",
-    //       },
-    //       order: order || nextOrder,
-    //       createdAt: new Date(),
-    //       updatedAt: new Date(),
-    //     };
-
-    //     const result = await db.collection("topics").insertOne(topicData);
-
-    //     // Update lesson's totalTopics count
-    //     await db
-    //       .collection("lessons")
-    //       .updateOne(
-    //         { _id: new ObjectId(lessonId) },
-    //         { $inc: { totalTopics: 1 } },
-    //       );
-
-    //     res.status(201).json({
-    //       success: true,
-    //       message: "Topic created successfully",
-    //       topic: { ...topicData, _id: result.insertedId },
-    //     });
-    //   } catch (error) {
-    //     console.error("Create topic error:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       message: "Failed to create topic",
-    //       error: error.message,
-    //     });
-    //   }
-    // });
-
-    // PUT update topic
-
     // CREATE topic
-    app.post("/topics", authenticateToken, async (req, res) => {
+    api.post("/topics", authenticateToken, async (req, res) => {
       try {
         const { lessonId, title, content, type, duration, order } = req.body;
 
@@ -5258,16 +5701,17 @@ async function run() {
           topic: { ...topicData, _id: result.insertedId },
         });
       } catch (error) {
-        console.error("Create topic error:", error);
+        logger.error("Create topic error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to create topic",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
-    app.put("/topics/:topicId", async (req, res) => {
+    api.put("/topics/:topicId", async (req, res) => {
       try {
         const { topicId } = req.params;
         const { title, content, order } = req.body;
@@ -5301,129 +5745,18 @@ async function run() {
           message: "Topic updated successfully",
         });
       } catch (error) {
-        console.error("Update topic error:", error);
+        logger.error("Update topic error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to update topic",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // DELETE topic
-
-    // UPDATE topic
-    // app.patch("/topics/:id", authenticateToken, async (req, res) => {
-    //   try {
-    //     const { id } = req.params;
-
-    //     if (!ObjectId.isValid(id)) {
-    //       return res.status(400).json({
-    //         success: false,
-    //         message: "Invalid topic ID",
-    //       });
-    //     }
-
-    //     const topic = await topicCollection.findOne({ _id: new ObjectId(id) });
-
-    //     if (!topic) {
-    //       return res.status(404).json({
-    //         success: false,
-    //         message: "Topic not found",
-    //       });
-    //     }
-
-    //     // Check permissions
-    //     const user = await userCollection.findOne({
-    //       _id: new ObjectId(req.user.userId),
-    //     });
-    //     const course = await courseCollection.findOne({ _id: topic.courseId });
-
-    //     if (
-    //       user.role !== "admin" &&
-    //       course?.instructor?._id?.toString() !== user._id.toString()
-    //     ) {
-    //       return res.status(403).json({
-    //         success: false,
-    //         message: "Unauthorized to update this topic",
-    //       });
-    //     }
-
-    //     const result = await topicCollection.updateOne(
-    //       { _id: new ObjectId(id) },
-    //       {
-    //         $set: {
-    //           ...req.body,
-    //           updatedAt: new Date(),
-    //         },
-    //       },
-    //     );
-
-    //     res.json({
-    //       success: true,
-    //       message: "Topic updated successfully",
-    //       modifiedCount: result.modifiedCount,
-    //     });
-    //   } catch (error) {
-    //     console.error("Update topic error:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       message: "Failed to update topic",
-    //       error: error.message,
-    //     });
-    //   }
-    // });
-
-    // app.delete("/topics/:topicId", async (req, res) => {
-    //   try {
-    //     const { topicId } = req.params;
-
-    //     // Validate ID
-    //     if (!ObjectId.isValid(topicId)) {
-    //       return res
-    //         .status(400)
-    //         .json({ success: false, message: "Invalid topic ID format" });
-    //     }
-
-    //     // Get topic to find lessonId
-    //     const topic = await db.collection("topics").findOne({
-    //       _id: new ObjectId(topicId),
-    //     });
-
-    //     if (!topic) {
-    //       return res
-    //         .status(404)
-    //         .json({ success: false, message: "Topic not found" });
-    //     }
-
-    //     // Delete the topic
-    //     const result = await db.collection("topics").deleteOne({
-    //       _id: new ObjectId(topicId),
-    //     });
-
-    //     // Update lesson's totalTopics count
-    //     await db
-    //       .collection("lessons")
-    //       .updateOne({ _id: topic.lessonId }, { $inc: { totalTopics: -1 } });
-
-    //     res.json({
-    //       success: true,
-    //       message: "Topic deleted successfully",
-    //     });
-    //   } catch (error) {
-    //     console.error("Delete topic error:", error);
-    //     res.status(500).json({
-    //       success: false,
-    //       message: "Failed to delete topic",
-    //       error: error.message,
-    //     });
-    //   }
-    // });
-
-    // POST reorder topics
-
-    // DELETE topic
-    app.delete("/topics/:id", authenticateToken, async (req, res) => {
+    api.delete("/topics/:id", authenticateToken, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -5477,16 +5810,17 @@ async function run() {
           message: "Topic deleted successfully",
         });
       } catch (error) {
-        console.error("Delete topic error:", error);
+        logger.error("Delete topic error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to delete topic",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
-    app.post("/topics/reorder", async (req, res) => {
+    api.post("/topics/reorder", async (req, res) => {
       try {
         const { topics } = req.body;
 
@@ -5512,18 +5846,19 @@ async function run() {
           message: "Topics reordered successfully",
         });
       } catch (error) {
-        console.error("Reorder topics error:", error);
+        logger.error("Reorder topics error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to reorder topics",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // ============= INSTRUCTOR ANNOUNCEMENT ROUTE =============
     // Send announcement to all enrolled students
-    app.post(
+    api.post(
       "/courses/:courseId/announcement",
       authenticateToken,
       async (req, res) => {
@@ -5577,18 +5912,21 @@ async function run() {
             message: "Announcement sent successfully to all enrolled students",
           });
         } catch (error) {
-          console.error("Send announcement error:", error);
+          logger.error("Send announcement error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to send announcement",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // GET enrolled students count
-    app.get("/courses/:courseId/enrolled-count", async (req, res) => {
+    api.get("/courses/:courseId/enrolled-count", async (req, res) => {
       try {
         const { courseId } = req.params;
 
@@ -5604,7 +5942,7 @@ async function run() {
           count,
         });
       } catch (error) {
-        console.error("Error fetching enrolled count:", error);
+        logger.error("Error fetching enrolled count:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch enrolled count",
@@ -5613,7 +5951,7 @@ async function run() {
     });
 
     // 1. Create bKash payment (initialize payment)
-    app.post("/payments/bkash/create", authenticateToken, async (req, res) => {
+    api.post("/payments/bkash/create", authenticateToken, async (req, res) => {
       try {
         const { courseId, amount } = req.body;
         const userId = req.user.userId;
@@ -5724,21 +6062,22 @@ async function run() {
           throw new Error("Failed to create bKash payment");
         }
       } catch (error) {
-        console.error("bKash create payment error:", error);
+        logger.error("bKash create payment error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to create payment",
-          error: error.message,
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
         });
       }
     });
 
     // 2. bKash Callback URL (handles payment response)
-    app.get("/payments/bkash/callback", async (req, res) => {
+    api.get("/payments/bkash/callback", async (req, res) => {
       try {
         const { paymentID, status } = req.query;
 
-        console.log("📞 bKash Callback received:", { paymentID, status });
+        logger.log("📞 bKash Callback received:", { paymentID, status });
 
         if (status === "success" && paymentID) {
           // First, find the payment by paymentID to get merchantInvoiceNumber
@@ -5747,13 +6086,13 @@ async function run() {
           });
 
           if (!payment) {
-            console.error("❌ Payment not found for paymentID:", paymentID);
+            logger.error("❌ Payment not found for paymentID:", paymentID);
             return res.redirect(
               `${process.env.BKASH_FRONTEND_URL}/payment/failed?error=payment_not_found`,
             );
           }
 
-          console.log("✅ Found payment record:", {
+          logger.log("✅ Found payment record:", {
             merchantInvoiceNumber: payment.merchantInvoiceNumber,
             amount: payment.amount,
           });
@@ -5766,13 +6105,13 @@ async function run() {
             const bKashData = executeResponse.data;
 
             if (!bKashData.trxID) {
-              console.error("❌ No trxID in bKash response:", bKashData);
+              logger.error("❌ No trxID in bKash response:", bKashData);
               return res.redirect(
                 `${process.env.BKASH_FRONTEND_URL}/payment/failed?error=no_transaction_id`,
               );
             }
 
-            console.log(
+            logger.log(
               "✅ Payment executed successfully with trxID:",
               bKashData.trxID,
             );
@@ -5788,17 +6127,14 @@ async function run() {
               `${process.env.BKASH_FRONTEND_URL}/payment/success?invoice=${payment.merchantInvoiceNumber}`,
             );
           } else {
-            console.error(
-              "❌ Payment execution failed:",
-              executeResponse.error,
-            );
+            logger.error("❌ Payment execution failed:", executeResponse.error);
             return res.redirect(
               `${process.env.BKASH_FRONTEND_URL}/payment/failed?invoice=${payment.merchantInvoiceNumber}`,
             );
           }
         } else {
           // Payment failed or cancelled
-          console.log("❌ Payment failed or cancelled:", { paymentID, status });
+          logger.log("❌ Payment failed or cancelled:", { paymentID, status });
 
           if (paymentID) {
             const payment = await paymentCollection.findOne({
@@ -5825,7 +6161,7 @@ async function run() {
           );
         }
       } catch (error) {
-        console.error("❌ bKash callback error:", error);
+        logger.error("❌ bKash callback error:", error);
         res.redirect(`${process.env.BKASH_FRONTEND_URL}/payment/error`);
       }
     });
@@ -5833,7 +6169,7 @@ async function run() {
     // Helper function to execute bKash payment
     async function executeBkashPayment(paymentID) {
       try {
-        console.log("🔄 Executing bKash payment for paymentID:", paymentID);
+        logger.log("🔄 Executing bKash payment for paymentID:", paymentID);
 
         // Get new token for execution
         const tokenResponse = await axios.post(
@@ -5852,7 +6188,7 @@ async function run() {
         );
 
         const id_token = tokenResponse.data.id_token;
-        console.log("✅ Got execution token");
+        logger.log("✅ Got execution token");
 
         // Execute payment
         const executeResponse = await axios.post(
@@ -5867,7 +6203,7 @@ async function run() {
           },
         );
 
-        console.log("✅ bKash execute response received:", {
+        logger.log("✅ bKash execute response received:", {
           trxID: executeResponse.data.trxID,
           amount: executeResponse.data.amount,
           paymentID: executeResponse.data.paymentID,
@@ -5875,7 +6211,7 @@ async function run() {
 
         return { success: true, data: executeResponse.data };
       } catch (error) {
-        console.error(
+        logger.error(
           "❌ Execute bKash payment error:",
           error.response?.data || error.message,
         );
@@ -5884,7 +6220,7 @@ async function run() {
     }
 
     // 3. Query payment status
-    app.get(
+    api.get(
       "/payments/status/:merchantInvoiceNumber",
       authenticateToken,
       async (req, res) => {
@@ -5926,7 +6262,7 @@ async function run() {
             },
           });
         } catch (error) {
-          console.error("Payment status error:", error);
+          logger.error("Payment status error:", error);
           res
             .status(500)
             .json({ success: false, message: "Failed to get payment status" });
@@ -5935,7 +6271,7 @@ async function run() {
     );
 
     // 4. Get payment history for user
-    app.get("/payments/history", authenticateToken, async (req, res) => {
+    api.get("/payments/history", authenticateToken, async (req, res) => {
       try {
         const userId = req.user.userId;
         const page = parseInt(req.query.page) || 1;
@@ -5978,7 +6314,7 @@ async function run() {
           },
         });
       } catch (error) {
-        console.error("Payment history error:", error);
+        logger.error("Payment history error:", error);
         res
           .status(500)
           .json({ success: false, message: "Failed to get payment history" });
@@ -6274,7 +6610,7 @@ async function run() {
       // Send payment confirmation email
       sendPaymentConfirmation: async (paymentData, userData, courseData) => {
         try {
-          console.log(
+          logger.log(
             "📧 Preparing payment confirmation email for:",
             userData.email,
           );
@@ -6312,18 +6648,11 @@ async function run() {
             to: userData.email,
             subject: template.subject,
             html: template.html,
-            // attachments: [
-            //   {
-            //     filename: `invoice-${paymentData.merchantInvoiceNumber}.pdf`,
-            //     content: pdfBuffer,
-            //     contentType: 'application/pdf'
-            //   }
-            // ]
           };
 
           // const info = await transporter.sendMail(mailOptions);
           const info = transporter.sendMail(mailOptions);
-          console.log("✅ Payment confirmation email sent:", info.messageId);
+          logger.log("✅ Payment confirmation email sent:", info.messageId);
 
           // Log email in database
           await db.collection("emailLogs").insertOne({
@@ -6338,7 +6667,7 @@ async function run() {
 
           return { success: true, messageId: info.messageId };
         } catch (error) {
-          console.error("❌ Failed to send payment confirmation email:", error);
+          logger.error("❌ Failed to send payment confirmation email:", error);
 
           // Log failed email
           await db.collection("emailLogs").insertOne({
@@ -6346,7 +6675,10 @@ async function run() {
             userId: userData?._id,
             email: userData?.email,
             merchantInvoiceNumber: paymentData?.merchantInvoiceNumber,
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
             attemptedAt: new Date(),
             status: "failed",
           });
@@ -6376,9 +6708,9 @@ async function run() {
           };
 
           await transporter.sendMail(mailOptions);
-          console.log("✅ Admin notification sent");
+          logger.log("✅ Admin notification sent");
         } catch (error) {
-          console.error("❌ Failed to send admin notification:", error);
+          logger.error("❌ Failed to send admin notification:", error);
         }
       },
     };
@@ -6387,7 +6719,7 @@ async function run() {
     // Update the handleSuccessfulPayment function with stats updates
     async function handleSuccessfulPayment(bKashData, merchantInvoiceNumber) {
       try {
-        console.log("💰 Handling successful payment:", {
+        logger.log("💰 Handling successful payment:", {
           trxID: bKashData.trxID,
           merchantInvoiceNumber,
         });
@@ -6410,7 +6742,7 @@ async function run() {
           },
         );
 
-        console.log("✅ Payment record updated:", updateResult);
+        logger.log("✅ Payment record updated:", updateResult);
 
         // Find the updated payment to get userId and courseId
         const payment = await paymentCollection.findOne({
@@ -6418,14 +6750,14 @@ async function run() {
         });
 
         if (!payment) {
-          console.error(
+          logger.error(
             "❌ Payment not found after update:",
             merchantInvoiceNumber,
           );
           return;
         }
 
-        console.log("✅ Found payment record:", {
+        logger.log("✅ Found payment record:", {
           userId: payment.userId,
           courseId: payment.courseId,
           amount: payment.amount,
@@ -6436,18 +6768,18 @@ async function run() {
           _id: payment.courseId,
         });
         if (!course) {
-          console.error("❌ Course not found:", payment.courseId);
+          logger.error("❌ Course not found:", payment.courseId);
           return;
         }
 
         // Get user details
         const user = await userCollection.findOne({ _id: payment.userId });
         if (!user) {
-          console.error("❌ User not found:", payment.userId);
+          logger.error("❌ User not found:", payment.userId);
           return;
         }
 
-        console.log("✅ Found course and user:", {
+        logger.log("✅ Found course and user:", {
           course: course.title,
           user: user.email,
         });
@@ -6484,7 +6816,7 @@ async function run() {
           { $push: { enrolledCourses: enrollmentData } },
         );
 
-        console.log("✅ User enrolled successfully:", enrollResult);
+        logger.log("✅ User enrolled successfully:", enrollResult);
 
         // ===== UPDATE COURSE STATS =====
         // Increment total students count
@@ -6499,7 +6831,7 @@ async function run() {
           { $inc: { "stats.enrolledCount": 1 } },
         );
 
-        console.log("✅ Course stats updated: totalStudents incremented");
+        logger.log("✅ Course stats updated: totalStudents incremented");
 
         // ===== UPDATE INSTRUCTOR STATS =====
         // Update instructor's students taught count if instructor exists
@@ -6508,9 +6840,7 @@ async function run() {
             { _id: course.instructor._id },
             { $inc: { studentsTaught: 1 } },
           );
-          console.log(
-            "✅ Instructor stats updated: studentsTaught incremented",
-          );
+          logger.log("✅ Instructor stats updated: studentsTaught incremented");
         }
 
         // ===== UPDATE REVENUE STATS =====
@@ -6544,9 +6874,9 @@ async function run() {
             user,
             course,
           );
-          console.log("✅ Payment confirmation email sent");
+          logger.log("✅ Payment confirmation email sent");
         } catch (emailError) {
-          console.error("❌ Failed to send email:", emailError);
+          logger.error("❌ Failed to send email:", emailError);
         }
 
         // Optional: Send admin notification
@@ -6557,10 +6887,10 @@ async function run() {
             course,
           );
         } catch (adminError) {
-          console.error("❌ Failed to send admin notification:", adminError);
+          logger.error("❌ Failed to send admin notification:", adminError);
         }
       } catch (error) {
-        console.error("❌ Handle successful payment error:", error);
+        logger.error("❌ Handle successful payment error:", error);
       }
     }
 
@@ -6603,7 +6933,7 @@ async function run() {
             .fontSize(24)
             .font("Helvetica-Bold")
             .fillColor("#0D9488")
-            .text("LMS ACADEMY", { align: "center" });
+            .text("BD Programming", { align: "center" });
 
           doc.moveDown(0.5);
           doc
@@ -6878,7 +7208,7 @@ async function run() {
     };
 
     // ===== UPDATED PDF RECEIPT DOWNLOAD ROUTE =====
-    app.get(
+    api.get(
       "/payments/receipt/:merchantInvoiceNumber",
       authenticateToken,
       async (req, res) => {
@@ -6886,7 +7216,7 @@ async function run() {
           const { merchantInvoiceNumber } = req.params;
           const userId = req.user.userId;
 
-          console.log("📄 Generating PDF receipt for:", {
+          logger.log("📄 Generating PDF receipt for:", {
             merchantInvoiceNumber,
             userId,
           });
@@ -6898,13 +7228,13 @@ async function run() {
           });
 
           if (!payment) {
-            console.error("❌ Payment not found:", merchantInvoiceNumber);
+            logger.error("❌ Payment not found:", merchantInvoiceNumber);
             return res
               .status(404)
               .json({ success: false, message: "Payment not found" });
           }
 
-          console.log("✅ Payment found:", {
+          logger.log("✅ Payment found:", {
             id: payment._id,
             amount: payment.amount,
             trxID: payment.trxID,
@@ -6915,16 +7245,16 @@ async function run() {
             _id: payment.courseId,
           });
           if (!course) {
-            console.error("❌ Course not found:", payment.courseId);
+            logger.error("❌ Course not found:", payment.courseId);
           }
 
           // Get user details
           const user = await userCollection.findOne({ _id: userId });
           if (!user) {
-            console.error("❌ User not found:", userId);
+            logger.error("❌ User not found:", userId);
           }
 
-          console.log("✅ User and course found:", {
+          logger.log("✅ User and course found:", {
             userName: user?.name,
             userEmail: user?.email,
             courseTitle: course?.title,
@@ -6934,7 +7264,7 @@ async function run() {
             // Generate PDF
             const pdfBuffer = await generatePDFReceipt(payment, user, course);
 
-            console.log(
+            logger.log(
               "✅ PDF generated successfully, size:",
               pdfBuffer.length,
               "bytes",
@@ -6952,12 +7282,12 @@ async function run() {
             // Send the PDF buffer
             res.send(pdfBuffer);
           } catch (pdfError) {
-            console.error("❌ PDF generation error:", pdfError);
+            logger.error("❌ PDF generation error:", pdfError);
 
             // Fallback to text receipt if PDF fails
             const fallbackReceipt = `
 ===========================================
-      Reliable Code Solutions
+      BD Programming
       OFFICIAL PAYMENT RECEIPT
 ===========================================
 
@@ -6992,7 +7322,7 @@ Course: ${course?.title || "N/A"}
             res.send(fallbackReceipt);
           }
         } catch (error) {
-          console.error("❌ Download receipt error:", error);
+          logger.error("❌ Download receipt error:", error);
           res
             .status(500)
             .json({ success: false, message: "Failed to download receipt" });
@@ -7002,7 +7332,7 @@ Course: ${course?.title || "N/A"}
 
     // ===== UPDATE THE PAYMENT STATUS ROUTE =====
 
-    app.get(
+    api.get(
       "/payments/status/:merchantInvoiceNumber",
       authenticateToken,
       async (req, res) => {
@@ -7010,7 +7340,7 @@ Course: ${course?.title || "N/A"}
           const { merchantInvoiceNumber } = req.params;
           const userId = req.user.userId;
 
-          console.log("🔍 Checking payment status for:", merchantInvoiceNumber);
+          logger.log("🔍 Checking payment status for:", merchantInvoiceNumber);
 
           // Find payment
           const payment = await paymentCollection.findOne({
@@ -7047,7 +7377,7 @@ Course: ${course?.title || "N/A"}
               trxID: payment.trxID || payment.paymentData?.trxID || "N/A",
               createdAt: payment.createdAt,
               updatedAt: payment.updatedAt,
-              // Student information -直接从user对象获取
+              // Student information
               studentName: user?.name || "Student",
               studentEmail: user?.email || "student@example.com",
               studentId: user?.uniqueId || "N/A",
@@ -7058,14 +7388,14 @@ Course: ${course?.title || "N/A"}
             },
           };
 
-          console.log("✅ Sending payment status response with student:", {
+          logger.log("✅ Sending payment status response with student:", {
             name: responseData.payment.studentName,
             email: responseData.payment.studentEmail,
           });
 
           res.json(responseData);
         } catch (error) {
-          console.error("❌ Payment status error:", error);
+          logger.error("❌ Payment status error:", error);
           res
             .status(500)
             .json({ success: false, message: "Failed to get payment status" });
@@ -7076,7 +7406,7 @@ Course: ${course?.title || "N/A"}
     // ============= TESTIMONIALS API =============
     // PUBLIC: Get approved testimonials for homepage
     // GET random testimonials
-    app.get("/testimonials/random", async (req, res) => {
+    api.get("/testimonials/random", async (req, res) => {
       try {
         const { count = 5 } = req.query;
 
@@ -7095,12 +7425,12 @@ Course: ${course?.title || "N/A"}
           count: testimonials.length,
         });
       } catch (error) {
-        console.error("Error fetching random testimonials:", error);
+        logger.error("Error fetching random testimonials:", error);
         res.status(500).json({ message: "Server error" });
       }
     });
 
-    app.get("/testimonials", async (req, res) => {
+    api.get("/testimonials", async (req, res) => {
       try {
         const { limit = 6, featured } = req.query;
 
@@ -7126,13 +7456,13 @@ Course: ${course?.title || "N/A"}
           total: testimonials.length,
         });
       } catch (error) {
-        console.error("Error fetching testimonials:", error);
+        logger.error("Error fetching testimonials:", error);
         res.status(500).json({ message: "Server error" });
       }
     });
 
     // PUBLIC: Submit a testimonial (for registered users)
-    app.post("/testimonials", authenticateToken, async (req, res) => {
+    api.post("/testimonials", authenticateToken, async (req, res) => {
       try {
         const { comment, rating, course } = req.body;
 
@@ -7170,13 +7500,13 @@ Course: ${course?.title || "N/A"}
           testimonialId: result.insertedId,
         });
       } catch (error) {
-        console.error("Error submitting testimonial:", error);
+        logger.error("Error submitting testimonial:", error);
         res.status(500).json({ message: "Server error" });
       }
     });
 
     // ADMIN: Get all testimonials with pagination and filters
-    app.get(
+    api.get(
       "/admin/testimonials",
       authenticateToken,
       isAdmin,
@@ -7227,14 +7557,14 @@ Course: ${course?.title || "N/A"}
             },
           });
         } catch (error) {
-          console.error("Error fetching admin testimonials:", error);
+          logger.error("Error fetching admin testimonials:", error);
           res.status(500).json({ message: "Server error" });
         }
       },
     );
 
     // ADMIN: Update testimonial status/approval
-    app.put(
+    api.put(
       "/admin/testimonials/:id",
       authenticateToken,
       isAdmin,
@@ -7276,14 +7606,14 @@ Course: ${course?.title || "N/A"}
             message: "Testimonial updated successfully",
           });
         } catch (error) {
-          console.error("Error updating testimonial:", error);
+          logger.error("Error updating testimonial:", error);
           res.status(500).json({ message: "Server error" });
         }
       },
     );
 
     // ADMIN: Delete testimonial
-    app.delete(
+    api.delete(
       "/admin/testimonials/:id",
       authenticateToken,
       isAdmin,
@@ -7304,14 +7634,14 @@ Course: ${course?.title || "N/A"}
             message: "Testimonial deleted successfully",
           });
         } catch (error) {
-          console.error("Error deleting testimonial:", error);
+          logger.error("Error deleting testimonial:", error);
           res.status(500).json({ message: "Server error" });
         }
       },
     );
 
     // ADMIN: Bulk actions on testimonials
-    app.post(
+    api.post(
       "/admin/testimonials/bulk",
       authenticateToken,
       isAdmin,
@@ -7370,14 +7700,14 @@ Course: ${course?.title || "N/A"}
             message: `Updated ${result.modifiedCount} testimonials`,
           });
         } catch (error) {
-          console.error("Error in bulk action:", error);
+          logger.error("Error in bulk action:", error);
           res.status(500).json({ message: "Server error" });
         }
       },
     );
 
     // Get all contacts (admin only)
-    app.get("/contacts", authenticateToken, isAdmin, async (req, res) => {
+    api.get("/contacts", authenticateToken, isAdmin, async (req, res) => {
       try {
         const { page = 1, limit = 10, status } = req.query;
         const query = status ? { status } : {};
@@ -7398,13 +7728,13 @@ Course: ${course?.title || "N/A"}
           totalPages: Math.ceil(total / limit),
         });
       } catch (error) {
-        console.error("Error fetching contacts:", error);
+        logger.error("Error fetching contacts:", error);
         res.status(500).json({ error: "Failed to fetch contacts" });
       }
     });
 
     // Get single contact by ID (admin only)
-    app.get("/contacts/:id", authenticateToken, isAdmin, async (req, res) => {
+    api.get("/contacts/:id", authenticateToken, isAdmin, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -7423,13 +7753,13 @@ Course: ${course?.title || "N/A"}
 
         res.json({ success: true, contact });
       } catch (error) {
-        console.error("Error fetching contact:", error);
+        logger.error("Error fetching contact:", error);
         res.status(500).json({ error: "Failed to fetch contact" });
       }
     });
 
     // Update contact status (admin only)
-    app.patch("/contacts/:id", authenticateToken, isAdmin, async (req, res) => {
+    api.patch("/contacts/:id", authenticateToken, isAdmin, async (req, res) => {
       try {
         const { id } = req.params;
         const { status, response } = req.body;
@@ -7450,13 +7780,13 @@ Course: ${course?.title || "N/A"}
 
         res.json({ success: true, message: "Contact updated successfully" });
       } catch (error) {
-        console.error("Error updating contact:", error);
+        logger.error("Error updating contact:", error);
         res.status(500).json({ error: "Failed to update contact" });
       }
     });
 
     // Bulk actions on contacts (admin only)
-    app.post("/contacts/bulk", authenticateToken, isAdmin, async (req, res) => {
+    api.post("/contacts/bulk", authenticateToken, isAdmin, async (req, res) => {
       try {
         const { action, contactIds } = req.body;
 
@@ -7495,13 +7825,13 @@ Course: ${course?.title || "N/A"}
           modifiedCount: result.modifiedCount || result.deletedCount,
         });
       } catch (error) {
-        console.error("Error in bulk action:", error);
+        logger.error("Error in bulk action:", error);
         res.status(500).json({ error: "Failed to perform bulk action" });
       }
     });
 
     // Send email response
-    app.post(
+    api.post(
       "/contacts/:id/send-email",
       authenticateToken,
       isAdmin,
@@ -7557,14 +7887,14 @@ Course: ${course?.title || "N/A"}
 
           res.json({ success: true, message: "Email sent successfully" });
         } catch (error) {
-          console.error("Error sending email:", error);
+          logger.error("Error sending email:", error);
           res.status(500).json({ error: "Failed to send email" });
         }
       },
     );
 
     // Delete contact
-    app.delete(
+    api.delete(
       "/contacts/:id",
       authenticateToken,
       isAdmin,
@@ -7587,7 +7917,7 @@ Course: ${course?.title || "N/A"}
 
           res.json({ success: true, message: "Contact deleted successfully" });
         } catch (error) {
-          console.error("Error deleting contact:", error);
+          logger.error("Error deleting contact:", error);
           res.status(500).json({ error: "Failed to delete contact" });
         }
       },
@@ -7596,7 +7926,7 @@ Course: ${course?.title || "N/A"}
     // ============= REVIEW API ROUTES =============
 
     // POST - Create a new review (Authenticated users only)
-    app.post(
+    api.post(
       "/courses/:courseId/reviews",
       authenticateToken,
       async (req, res) => {
@@ -7676,18 +8006,21 @@ Course: ${course?.title || "N/A"}
             review,
           });
         } catch (error) {
-          console.error("Create review error:", error);
+          logger.error("Create review error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to submit review",
-            error: error.message,
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
           });
         }
       },
     );
 
     // GET - Get all reviews for a course (Public)
-    app.get("/courses/:courseId/reviews", async (req, res) => {
+    api.get("/courses/:courseId/reviews", async (req, res) => {
       try {
         const { courseId } = req.params;
         const { page = 1, limit = 10, sort = "recent" } = req.query;
@@ -7747,7 +8080,7 @@ Course: ${course?.title || "N/A"}
           distribution: ratingCounts,
         });
       } catch (error) {
-        console.error("Get reviews error:", error);
+        logger.error("Get reviews error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch reviews",
@@ -7756,7 +8089,7 @@ Course: ${course?.title || "N/A"}
     });
 
     // GET - Check if user can review (Authenticated)
-    app.get(
+    api.get(
       "/courses/:courseId/can-review",
       authenticateToken,
       async (req, res) => {
@@ -7798,7 +8131,7 @@ Course: ${course?.title || "N/A"}
             canReview: true,
           });
         } catch (error) {
-          console.error("Check review status error:", error);
+          logger.error("Check review status error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to check review status",
@@ -7808,7 +8141,7 @@ Course: ${course?.title || "N/A"}
     );
 
     // PATCH - Update review (Authenticated - own review only)
-    app.patch("/reviews/:reviewId", authenticateToken, async (req, res) => {
+    api.patch("/reviews/:reviewId", authenticateToken, async (req, res) => {
       try {
         const { reviewId } = req.params;
         const userId = req.user.userId;
@@ -7847,7 +8180,7 @@ Course: ${course?.title || "N/A"}
           message: "Review updated successfully",
         });
       } catch (error) {
-        console.error("Update review error:", error);
+        logger.error("Update review error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to update review",
@@ -7856,7 +8189,7 @@ Course: ${course?.title || "N/A"}
     });
 
     // DELETE - Delete review (Authenticated - own review only or Admin)
-    app.delete("/reviews/:reviewId", authenticateToken, async (req, res) => {
+    api.delete("/reviews/:reviewId", authenticateToken, async (req, res) => {
       try {
         const { reviewId } = req.params;
         const userId = req.user.userId;
@@ -7888,7 +8221,7 @@ Course: ${course?.title || "N/A"}
           message: "Review deleted successfully",
         });
       } catch (error) {
-        console.error("Delete review error:", error);
+        logger.error("Delete review error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to delete review",
@@ -7897,7 +8230,7 @@ Course: ${course?.title || "N/A"}
     });
 
     // POST - Mark review as helpful
-    app.post(
+    api.post(
       "/reviews/:reviewId/helpful",
       authenticateToken,
       async (req, res) => {
@@ -7914,7 +8247,7 @@ Course: ${course?.title || "N/A"}
             message: "Thank you for your feedback",
           });
         } catch (error) {
-          console.error("Helpful mark error:", error);
+          logger.error("Helpful mark error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to mark as helpful",
@@ -7989,14 +8322,1262 @@ Course: ${course?.title || "N/A"}
           );
         }
       } catch (error) {
-        console.error("Update course rating stats error:", error);
+        logger.error("Update course rating stats error:", error);
       }
     }
+
+    // =============Blog ROUTES =============
+
+    // Get all approved/published posts (Public)
+    api.get("/posts", async (req, res) => {
+      try {
+        const { page = 1, limit = 10, category, search } = req.query;
+
+        const query = { status: "published" };
+
+        // Category filter
+        if (category && category !== "all") {
+          // query.category = category;
+          query.category = { $regex: new RegExp(`^${category}$`, "i") };
+        }
+
+        // Search filter - Enhanced with tags search
+        if (search && search.trim()) {
+          const searchRegex = new RegExp(search.trim(), "i");
+          query.$or = [
+            { title: searchRegex },
+            { content: searchRegex },
+            { excerpt: searchRegex },
+            { tags: { $in: [searchRegex] } }, // ✅ ADDED: Search in tags
+          ];
+        }
+
+        const posts = await postCollection
+          .find(query)
+          .sort({ publishedAt: -1, createdAt: -1 })
+          .skip((parseInt(page) - 1) * parseInt(limit))
+          .limit(parseInt(limit))
+          .toArray();
+
+        const total = await postCollection.countDocuments(query);
+
+        // Format posts for frontend
+        const formattedPosts = posts.map((post) => ({
+          ...post,
+          _id: post._id.toString(),
+          views: post.views || 0,
+          likes: post.likes || 0,
+          createdAt: post.createdAt
+            ? new Date(post.createdAt).toISOString()
+            : new Date().toISOString(),
+        }));
+
+        res.json({
+          success: true,
+          posts: formattedPosts,
+          currentPage: parseInt(page),
+          totalPages: Math.ceil(total / parseInt(limit)),
+          total,
+        });
+      } catch (error) {
+        logger.error("Get posts error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch posts",
+        });
+      }
+    });
+
+    // Get single post by ID
+    api.get("/posts/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const userId = req.user?.userId;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid post ID format",
+          });
+        }
+
+        const post = await db.collection("posts").findOne({
+          _id: new ObjectId(id),
+        });
+
+        if (!post) {
+          return res.status(404).json({
+            success: false,
+            message: "Post not found",
+          });
+        }
+
+        // Check if user has permission to view this post
+        // Allow if: post is published OR user is the author OR user is admin
+        const isAuthor = post.authorId.toString() === userId;
+        const isAdmin = req.user?.role === "admin";
+        const isPublished = post.status === "published";
+
+        if (!isPublished && !isAuthor && !isAdmin) {
+          return res.status(404).json({
+            success: false,
+            message: "Post not found",
+          });
+        }
+
+        // Format the response
+        const formattedPost = {
+          ...post,
+          _id: post._id.toString(),
+          createdAt: post.createdAt
+            ? new Date(post.createdAt).toISOString()
+            : new Date().toISOString(),
+          updatedAt: post.updatedAt
+            ? new Date(post.updatedAt).toISOString()
+            : new Date().toISOString(),
+        };
+
+        // Only increment view count for published posts
+        if (isPublished) {
+          db.collection("posts")
+            .updateOne({ _id: new ObjectId(id) }, { $inc: { views: 1 } })
+            .catch((err) => console.error("Error incrementing views:", err));
+        }
+
+        res.json(formattedPost);
+      } catch (error) {
+        console.error("Error in GET /api/posts/:id:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch post",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
+      }
+    });
+
+    // Get user's own posts (with all statuses)
+    api.get("/my-posts", authenticateToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+        const { status, page = 1, limit = 10 } = req.query;
+
+        const query = { authorId: new ObjectId(userId) };
+        if (status && status !== "all") query.status = status;
+
+        const posts = await postCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .skip((parseInt(page) - 1) * parseInt(limit))
+          .limit(parseInt(limit))
+          .toArray();
+
+        const total = await postCollection.countDocuments(query);
+
+        res.json({
+          success: true,
+          posts,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total,
+            totalPages: Math.ceil(total / parseInt(limit)),
+          },
+        });
+      } catch (error) {
+        logger.error("Get my posts error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch your posts",
+        });
+      }
+    });
+
+    // Create a new blog post (Anyone logged in can create, but needs approval)
+    api.post("/posts", authenticateToken, async (req, res) => {
+      try {
+        const { title, content, excerpt, category, coverImage, tags } =
+          req.body;
+        const userId = req.user.userId;
+
+        // Validate required fields
+        if (!title || !content) {
+          return res.status(400).json({
+            success: false,
+            message: "Title and content are required",
+          });
+        }
+
+        // Get user details
+        const user = await userCollection.findOne({
+          _id: new ObjectId(userId),
+        });
+
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            message: "User not found",
+          });
+        }
+
+        // Create post with pending status (needs admin approval)
+        const newPost = {
+          title: title.trim(),
+          content,
+          excerpt: excerpt || content.substring(0, 160),
+          category: category || "Uncategorized",
+          coverImage: coverImage || null,
+          tags: tags || [],
+          authorId: new ObjectId(userId),
+          authorName: user.name,
+          authorEmail: user.email,
+          authorRole: user.role, // student, instructor, or admin
+          status: "pending", // pending, approved, rejected, published
+          views: 0,
+          likes: 0,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          // Admin review fields
+          reviewedBy: null,
+          reviewedAt: null,
+          rejectionReason: null,
+          publishedAt: null,
+        };
+
+        const result = await postCollection.insertOne(newPost);
+
+        // Update user's blog stats
+        await userCollection.updateOne(
+          { _id: new ObjectId(userId) },
+          {
+            $inc: {
+              "blogProfile.totalPosts": 1,
+              "blogProfile.totalPendingPosts": 1,
+            },
+          },
+        );
+
+        // Notify admins about new post for approval
+        const admins = await userCollection
+          .find({ role: "admin" })
+          .project({ _id: 1 })
+          .toArray();
+
+        if (admins.length > 0) {
+          await notificationService.sendToMany(
+            admins.map((a) => a._id),
+            {
+              type: "blog_post_pending",
+              message: `📝 New blog post awaiting approval: "${title}"`,
+              details: `Submitted by ${user.name} (${user.role})`,
+              actionUrl: `/admin/posts/${result.insertedId}/review`,
+            },
+          );
+        }
+
+        logger.log(
+          `✅ Post created: ${result.insertedId} by ${user.email} (status: pending)`,
+        );
+
+        res.status(201).json({
+          success: true,
+          message:
+            "Your post has been submitted for review. It will be published once approved by an admin.",
+          post: {
+            ...newPost,
+            _id: result.insertedId,
+          },
+        });
+      } catch (error) {
+        logger.error("Create post error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to create post",
+          error:
+            process.env.NODE_ENV === "development" ? error.message : undefined,
+        });
+      }
+    });
+
+    // Comments Routes
+    api.get("/posts/:postId/comments", async (req, res) => {
+      try {
+        const { postId } = req.params;
+
+        const comments = await db
+          .collection("comments")
+          .find({ postId, status: "approved" })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        // Format dates and ensure user info is present
+        const formattedComments = comments.map((comment) => ({
+          _id: comment._id,
+          author: comment.author,
+          email: comment.email,
+          content: comment.content,
+          createdAt: comment.createdAt
+            ? new Date(comment.createdAt).toISOString()
+            : new Date().toISOString(),
+        }));
+
+        res.json(formattedComments);
+      } catch (error) {
+        console.error("Error fetching comments:", error);
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // comment creation
+    api.post("/comments", authenticateToken, async (req, res) => {
+      try {
+        const { postId, content } = req.body;
+        const userId = req.user.userId;
+        const userEmail = req.user.email;
+        const userName = req.user.name;
+
+        // Validate input
+        if (!postId || !content) {
+          return res.status(400).json({
+            success: false,
+            message: "Post ID and content are required",
+          });
+        }
+
+        // Validate post exists
+        if (!ObjectId.isValid(postId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid post ID format",
+          });
+        }
+
+        const post = await db.collection("posts").findOne({
+          _id: new ObjectId(postId),
+        });
+
+        if (!post) {
+          return res.status(404).json({
+            success: false,
+            message: "Post not found",
+          });
+        }
+
+        // Create comment with authenticated user info
+        const newComment = {
+          postId,
+          userId: new ObjectId(userId),
+          author: userName,
+          email: userEmail,
+          content: content.trim(),
+          status: "approved",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const result = await db.collection("comments").insertOne(newComment);
+
+        // Increment comment count on post (optional)
+        await db
+          .collection("posts")
+          .updateOne(
+            { _id: new ObjectId(postId) },
+            { $inc: { commentsCount: 1 } },
+          );
+
+        // Notify post author (optional)
+        if (post.authorId.toString() !== userId) {
+          await notificationService.sendToUser(post.authorId, {
+            type: "blog_comment",
+            message: `💬 New comment on your post "${post.title}"`,
+            details: `${userName} commented: ${content.substring(0, 100)}...`,
+            actionUrl: `/posts/${postId}`,
+          });
+        }
+
+        res.status(201).json({
+          success: true,
+          message: "Comment posted successfully",
+          comment: {
+            ...newComment,
+            _id: result.insertedId,
+            createdAt: newComment.createdAt.toISOString(),
+          },
+        });
+      } catch (error) {
+        console.error("Error creating comment:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to post comment",
+        });
+      }
+    });
+
+    // Apply for author status
+    api.post("/users/apply-author", authenticateToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+
+        const result = await userCollection.updateOne(
+          { _id: new ObjectId(userId) },
+          {
+            $set: {
+              role: "pending_author",
+              blogApplication: {
+                appliedAt: new Date(),
+                status: "pending",
+                reviewedBy: null,
+                reviewedAt: null,
+              },
+            },
+          },
+        );
+
+        res.json({ success: true, message: "Application submitted" });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // Add before the main update logic
+    const validateProfileUpdate = (req, res, next) => {
+      const { profile, blogProfile, blogSettings } = req.body;
+
+      // Validate blogProfile structure if provided
+      if (blogProfile) {
+        const allowedFields = [
+          "authorBio",
+          "authorAvatar",
+          "socialLinks",
+          "authorBadges",
+          "totalPosts",
+          "totalLikes",
+          "totalViews",
+          "joinedAsAuthor",
+        ];
+        const invalidFields = Object.keys(blogProfile).filter(
+          (key) => !allowedFields.includes(key),
+        );
+
+        if (invalidFields.length > 0) {
+          return res.status(400).json({
+            success: false,
+            message: `Invalid blogProfile fields: ${invalidFields.join(", ")}`,
+          });
+        }
+
+        // Validate socialLinks if present
+        if (blogProfile.socialLinks) {
+          const allowedSocialFields = [
+            "personalWebsite",
+            "twitter",
+            "github",
+            "linkedin",
+          ];
+          const invalidSocialFields = Object.keys(
+            blogProfile.socialLinks,
+          ).filter((key) => !allowedSocialFields.includes(key));
+
+          if (invalidSocialFields.length > 0) {
+            return res.status(400).json({
+              success: false,
+              message: `Invalid socialLinks fields: ${invalidSocialFields.join(", ")}`,
+            });
+          }
+        }
+      }
+
+      // Validate blogSettings structure if provided
+      if (blogSettings) {
+        const allowedSettings = [
+          "emailSubscribers",
+          "commentNotifications",
+          "allowGuestComments",
+          "moderateComments",
+        ];
+        const invalidSettings = Object.keys(blogSettings).filter(
+          (key) => !allowedSettings.includes(key),
+        );
+
+        if (invalidSettings.length > 0) {
+          return res.status(400).json({
+            success: false,
+            message: `Invalid blogSettings fields: ${invalidSettings.join(", ")}`,
+          });
+        }
+      }
+
+      next();
+    };
+
+    // Update profile (enhanced for blog fields)
+    api.put(
+      "/users/profile",
+      authenticateToken,
+      validateProfileUpdate,
+      async (req, res) => {
+        try {
+          const {
+            name,
+            profile, // Existing profile (education, address, etc.)
+            blogProfile, // New: Blog author information
+            blogSettings, // New: Blog preferences
+          } = req.body;
+
+          const userId = req.user.userId;
+
+          // Validate at least one field is being updated
+          if (!name && !profile && !blogProfile && !blogSettings) {
+            return res.status(400).json({
+              success: false,
+              message: "No valid fields to update",
+            });
+          }
+
+          // Build update object - only include fields that are provided
+          const updateData = {
+            updatedAt: new Date(),
+          };
+
+          // Add fields only if they exist in request
+          if (name !== undefined && name !== null) {
+            // Sanitize name
+            const sanitizedName = name
+              .trim()
+              .replace(/[<>]/g, "")
+              .slice(0, 100);
+            if (sanitizedName.length === 0) {
+              return res.status(400).json({
+                success: false,
+                message: "Name cannot be empty",
+              });
+            }
+            updateData.name = sanitizedName;
+          }
+
+          if (profile !== undefined && profile !== null) {
+            // Validate profile structure
+            const allowedProfileFields = [
+              "phone",
+              "bio",
+              "address",
+              "education",
+              "socialLinks",
+            ];
+            const invalidFields = Object.keys(profile).filter(
+              (key) => !allowedProfileFields.includes(key),
+            );
+
+            if (
+              invalidFields.length > 0 &&
+              process.env.NODE_ENV !== "production"
+            ) {
+              logger.warn(
+                `Unknown profile fields: ${invalidFields.join(", ")}`,
+              );
+            }
+
+            updateData.profile = profile;
+          }
+
+          if (blogProfile !== undefined && blogProfile !== null) {
+            // Validate blogProfile structure
+            const allowedBlogFields = [
+              "authorBio",
+              "authorAvatar",
+              "socialLinks",
+              "authorBadges",
+              "totalPosts",
+              "totalLikes",
+              "totalViews",
+              "joinedAsAuthor",
+            ];
+            const invalidFields = Object.keys(blogProfile).filter(
+              (key) => !allowedBlogFields.includes(key),
+            );
+
+            if (invalidFields.length > 0) {
+              return res.status(400).json({
+                success: false,
+                message: `Invalid blogProfile fields: ${invalidFields.join(", ")}`,
+              });
+            }
+
+            // Sanitize author bio
+            if (blogProfile.authorBio) {
+              blogProfile.authorBio = blogProfile.authorBio
+                .trim()
+                .slice(0, 500);
+            }
+
+            updateData.blogProfile = blogProfile;
+          }
+
+          if (blogSettings !== undefined && blogSettings !== null) {
+            // Validate blogSettings structure
+            const allowedSettings = [
+              "emailSubscribers",
+              "commentNotifications",
+              "allowGuestComments",
+              "moderateComments",
+            ];
+            const invalidSettings = Object.keys(blogSettings).filter(
+              (key) => !allowedSettings.includes(key),
+            );
+
+            if (invalidSettings.length > 0) {
+              return res.status(400).json({
+                success: false,
+                message: `Invalid blogSettings fields: ${invalidSettings.join(", ")}`,
+              });
+            }
+
+            updateData.blogSettings = blogSettings;
+          }
+
+          // Fetch current user for initialization logic and permission checks
+          const user = await userCollection.findOne({
+            _id: new ObjectId(userId),
+          });
+
+          if (!user) {
+            return res.status(404).json({
+              success: false,
+              message: "User not found",
+            });
+          }
+
+          // Initialize blog fields if they don't exist (for first-time authors)
+          if (
+            !user.blogProfile &&
+            (blogProfile !== undefined || blogSettings !== undefined)
+          ) {
+            // Only initialize if we're not replacing the entire object
+            if (!updateData.blogProfile && blogProfile !== undefined) {
+              updateData.blogProfile = {
+                authorBio: user.profile?.bio || "",
+                authorAvatar: "",
+                socialLinks: {
+                  personalWebsite: "",
+                  ...(blogProfile.socialLinks || {}),
+                },
+                authorBadges: [],
+                totalPosts: 0,
+                totalLikes: 0,
+                totalViews: 0,
+                joinedAsAuthor: user.role === "author" ? new Date() : null,
+                ...blogProfile, // Override with provided values
+              };
+            }
+
+            if (!updateData.blogSettings && blogSettings !== undefined) {
+              updateData.blogSettings = {
+                emailSubscribers: false,
+                commentNotifications: true,
+                allowGuestComments: true,
+                moderateComments: false,
+                ...blogSettings, // Override with provided values
+              };
+            }
+          }
+
+          // Prevent non-authors from setting certain blog fields
+          if (user.role !== "author" && user.role !== "admin") {
+            if (updateData.blogProfile) {
+              // Remove fields that shouldn't be set by non-authors
+              delete updateData.blogProfile.totalPosts;
+              delete updateData.blogProfile.totalLikes;
+              delete updateData.blogProfile.totalViews;
+              delete updateData.blogProfile.authorBadges;
+            }
+          }
+
+          // Perform the update
+          const result = await userCollection.updateOne(
+            { _id: new ObjectId(userId) },
+            { $set: updateData },
+          );
+
+          // Check if update was successful
+          if (result.matchedCount === 0) {
+            return res.status(404).json({
+              success: false,
+              message: "User not found",
+            });
+          }
+
+          // Fetch updated user to return full profile
+          const updatedUser = await userCollection.findOne({
+            _id: new ObjectId(userId),
+          });
+
+          if (!updatedUser) {
+            return res.status(404).json({
+              success: false,
+              message: "User not found after update",
+            });
+          }
+
+          // Remove sensitive data
+          const {
+            password,
+            emailVerificationToken,
+            ...userWithoutSensitiveData
+          } = updatedUser;
+
+          // Log success (but don't expose sensitive info)
+          logger.log(`Profile updated for user: ${userId}`);
+
+          res.json({
+            success: true,
+            message: "Profile updated successfully",
+            user: userWithoutSensitiveData,
+          });
+        } catch (error) {
+          logger.error("Update profile error:", error);
+
+          // Handle specific MongoDB errors
+          if (error.code === 121) {
+            // Document validation error
+            return res.status(400).json({
+              success: false,
+              message: "Invalid data format",
+            });
+          }
+
+          res.status(500).json({
+            success: false,
+            message: "Failed to update profile",
+            error:
+              process.env.NODE_ENV === "development"
+                ? error.message
+                : undefined,
+          });
+        }
+      },
+    );
+
+    // Apply for author status
+    api.post("/users/apply-author", authenticateToken, async (req, res) => {
+      try {
+        const userId = req.user.userId;
+
+        const result = await userCollection.updateOne(
+          { _id: new ObjectId(userId) },
+          {
+            $set: {
+              role: "pending_author",
+              blogApplication: {
+                appliedAt: new Date(),
+                status: "pending",
+                reviewedBy: null,
+                reviewedAt: null,
+              },
+            },
+          },
+        );
+
+        res.json({ success: true, message: "Application submitted" });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // ============= ADMIN POST MANAGEMENT =============
+
+    // Get all posts for admin review
+    api.get("/admin/posts", authenticateToken, async (req, res) => {
+      try {
+        // Check if user is admin
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+
+        if (user.role !== "admin") {
+          return res.status(403).json({
+            success: false,
+            message: "Admin access required",
+          });
+        }
+
+        const { status = "pending", page = 1, limit = 20, author } = req.query;
+
+        const query = {};
+        if (status !== "all") query.status = status;
+        if (author && ObjectId.isValid(author))
+          query.authorId = new ObjectId(author);
+
+        const posts = await postCollection
+          .find(query)
+          .sort({ createdAt: -1 })
+          .skip((parseInt(page) - 1) * parseInt(limit))
+          .limit(parseInt(limit))
+          .toArray();
+
+        const total = await postCollection.countDocuments(query);
+
+        // Get author details for each post
+        const postsWithAuthor = await Promise.all(
+          posts.map(async (post) => {
+            const author = await userCollection.findOne(
+              { _id: post.authorId },
+              { projection: { name: 1, email: 1, role: 1, profile: 1 } },
+            );
+            return { ...post, authorDetails: author };
+          }),
+        );
+
+        res.json({
+          success: true,
+          posts: postsWithAuthor,
+          pagination: {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            total,
+            totalPages: Math.ceil(total / parseInt(limit)),
+          },
+        });
+      } catch (error) {
+        logger.error("Get admin posts error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch posts",
+        });
+      }
+    });
+
+    // Approve a post (Admin only)
+    api.patch(
+      "/admin/posts/:postId/approve",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          // Check if user is admin
+          const user = await userCollection.findOne({
+            _id: new ObjectId(req.user.userId),
+          });
+
+          if (user.role !== "admin") {
+            return res.status(403).json({
+              success: false,
+              message: "Admin access required",
+            });
+          }
+
+          const { postId } = req.params;
+
+          if (!ObjectId.isValid(postId)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid post ID format",
+            });
+          }
+
+          const post = await postCollection.findOne({
+            _id: new ObjectId(postId),
+          });
+
+          if (!post) {
+            return res.status(404).json({
+              success: false,
+              message: "Post not found",
+            });
+          }
+
+          if (post.status === "published") {
+            return res.status(400).json({
+              success: false,
+              message: "Post is already published",
+            });
+          }
+
+          // Update post status to published
+          await postCollection.updateOne(
+            { _id: new ObjectId(postId) },
+            {
+              $set: {
+                status: "published",
+                reviewedBy: new ObjectId(req.user.userId),
+                reviewedAt: new Date(),
+                publishedAt: new Date(),
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+          // Update user's blog stats
+          await userCollection.updateOne(
+            { _id: post.authorId },
+            {
+              $inc: {
+                "blogProfile.totalApprovedPosts": 1,
+                "blogProfile.totalPendingPosts": -1,
+              },
+            },
+          );
+
+          // Notify author that post is approved
+          await notificationService.sendToUser(post.authorId, {
+            type: "blog_post_approved",
+            message: `✅ Your post "${post.title}" has been approved and published!`,
+            details: "Your post is now visible to all readers.",
+            actionUrl: `/posts/${postId}`,
+          });
+
+          logger.log(`✅ Post approved: ${postId} by admin ${user.email}`);
+
+          res.json({
+            success: true,
+            message: "Post approved and published successfully",
+          });
+        } catch (error) {
+          logger.error("Approve post error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to approve post",
+          });
+        }
+      },
+    );
+
+    // Reject a post (Admin only)
+    api.patch(
+      "/admin/posts/:postId/reject",
+      authenticateToken,
+      async (req, res) => {
+        try {
+          const user = await userCollection.findOne({
+            _id: new ObjectId(req.user.userId),
+          });
+
+          if (user.role !== "admin") {
+            return res.status(403).json({
+              success: false,
+              message: "Admin access required",
+            });
+          }
+
+          const { postId } = req.params;
+          const { rejectionReason } = req.body;
+
+          if (!ObjectId.isValid(postId)) {
+            return res.status(400).json({
+              success: false,
+              message: "Invalid post ID format",
+            });
+          }
+
+          const post = await postCollection.findOne({
+            _id: new ObjectId(postId),
+          });
+
+          if (!post) {
+            return res.status(404).json({
+              success: false,
+              message: "Post not found",
+            });
+          }
+
+          await postCollection.updateOne(
+            { _id: new ObjectId(postId) },
+            {
+              $set: {
+                status: "rejected",
+                reviewedBy: new ObjectId(req.user.userId),
+                reviewedAt: new Date(),
+                rejectionReason:
+                  rejectionReason || "Does not meet our content guidelines",
+                updatedAt: new Date(),
+              },
+            },
+          );
+
+          // Update user's blog stats
+          await userCollection.updateOne(
+            { _id: post.authorId },
+            {
+              $inc: {
+                "blogProfile.totalRejectedPosts": 1,
+                "blogProfile.totalPendingPosts": -1,
+              },
+            },
+          );
+
+          // Notify author about rejection
+          await notificationService.sendToUser(post.authorId, {
+            type: "blog_post_rejected",
+            message: `❌ Your post "${post.title}" was not approved`,
+            details:
+              rejectionReason ||
+              "Does not meet our content guidelines. Please review and resubmit.",
+            actionUrl: `/my-posts/${postId}/edit`,
+          });
+
+          logger.log(`❌ Post rejected: ${postId} by admin ${user.email}`);
+
+          res.json({
+            success: true,
+            message: "Post rejected successfully",
+          });
+        } catch (error) {
+          logger.error("Reject post error:", error);
+          res.status(500).json({
+            success: false,
+            message: "Failed to reject post",
+          });
+        }
+      },
+    );
+
+    // Update post (Author or Admin)
+    api.put("/posts/:postId", authenticateToken, async (req, res) => {
+      try {
+        const { postId } = req.params;
+        const { title, content, excerpt, category, coverImage, tags } =
+          req.body;
+        const userId = req.user.userId;
+
+        if (!ObjectId.isValid(postId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid post ID format",
+          });
+        }
+
+        const post = await postCollection.findOne({
+          _id: new ObjectId(postId),
+        });
+
+        if (!post) {
+          return res.status(404).json({
+            success: false,
+            message: "Post not found",
+          });
+        }
+
+        // Check if user is author or admin
+        if (post.authorId.toString() !== userId && req.user.role !== "admin") {
+          return res.status(403).json({
+            success: false,
+            message: "You can only edit your own posts",
+          });
+        }
+
+        // If post was published, set status back to pending for re-approval
+        const newStatus = post.status === "published" ? "pending" : post.status;
+
+        const updateData = {
+          ...(title && { title: title.trim() }),
+          ...(content && { content }),
+          ...(excerpt && { excerpt }),
+          ...(category && { category }),
+          ...(coverImage !== undefined && { coverImage }),
+          ...(tags && { tags }),
+          status: newStatus,
+          updatedAt: new Date(),
+          ...(newStatus === "pending" && {
+            reviewedBy: null,
+            reviewedAt: null,
+            publishedAt: null,
+          }),
+        };
+
+        const result = await postCollection.updateOne(
+          { _id: new ObjectId(postId) },
+          { $set: updateData },
+        );
+
+        res.json({
+          success: true,
+          message:
+            post.status === "published"
+              ? "Post updated and pending re-approval"
+              : "Post updated successfully",
+        });
+      } catch (error) {
+        console.error("Update post error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to update post",
+        });
+      }
+    });
+    // Delete post (Author or Admin)
+    api.delete("/posts/:postId", authenticateToken, async (req, res) => {
+      try {
+        const { postId } = req.params;
+        const userId = req.user.userId;
+
+        if (!ObjectId.isValid(postId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid post ID format",
+          });
+        }
+
+        const post = await postCollection.findOne({
+          _id: new ObjectId(postId),
+        });
+
+        if (!post) {
+          return res.status(404).json({
+            success: false,
+            message: "Post not found",
+          });
+        }
+
+        const user = await userCollection.findOne({
+          _id: new ObjectId(userId),
+        });
+
+        if (post.authorId.toString() !== userId && user.role !== "admin") {
+          return res.status(403).json({
+            success: false,
+            message: "You can only delete your own posts",
+          });
+        }
+
+        await postCollection.deleteOne({ _id: new ObjectId(postId) });
+
+        // Update user's blog stats
+        const decrementField =
+          post.status === "published"
+            ? "blogProfile.totalApprovedPosts"
+            : post.status === "pending"
+              ? "blogProfile.totalPendingPosts"
+              : "blogProfile.totalRejectedPosts";
+
+        await userCollection.updateOne(
+          { _id: post.authorId },
+          {
+            $inc: {
+              "blogProfile.totalPosts": -1,
+              [decrementField]: -1,
+            },
+          },
+        );
+
+        res.json({
+          success: true,
+          message: "Post deleted successfully",
+        });
+      } catch (error) {
+        logger.error("Delete post error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to delete post",
+        });
+      }
+    });
+
+    // Get posts statistics for admin
+    api.get("/admin/posts/stats", authenticateToken, async (req, res) => {
+      try {
+        // Check if user is admin
+        const user = await userCollection.findOne({
+          _id: new ObjectId(req.user.userId),
+        });
+
+        if (user.role !== "admin") {
+          return res.status(403).json({
+            success: false,
+            message: "Admin access required",
+          });
+        }
+
+        const total = await postCollection.countDocuments();
+        const pending = await postCollection.countDocuments({
+          status: "pending",
+        });
+        const published = await postCollection.countDocuments({
+          status: "published",
+        });
+        const rejected = await postCollection.countDocuments({
+          status: "rejected",
+        });
+
+        res.json({
+          success: true,
+          stats: {
+            total,
+            pending,
+            published,
+            rejected,
+          },
+        });
+      } catch (error) {
+        console.error("Error fetching post stats:", error);
+        res.status(500).json({
+          success: false,
+          message: "Failed to fetch stats",
+        });
+      }
+    });
+
+    // Check if user liked the post
+    api.get("/posts/:id/like-status", authenticateToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const userId = req.user.userId;
+
+        const like = await db.collection("likes").findOne({
+          postId: id,
+          userId: new ObjectId(userId),
+        });
+
+        res.json({ liked: !!like });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // Like a post
+    api.post("/posts/:id/like", authenticateToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const userId = req.user.userId;
+
+        await db.collection("likes").insertOne({
+          postId: id,
+          userId: new ObjectId(userId),
+          createdAt: new Date(),
+        });
+
+        await db
+          .collection("posts")
+          .updateOne({ _id: new ObjectId(id) }, { $inc: { likes: 1 } });
+
+        res.json({ success: true, liked: true });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+    // Unlike a post
+    api.post("/posts/:id/unlike", authenticateToken, async (req, res) => {
+      try {
+        const { id } = req.params;
+        const userId = req.user.userId;
+
+        await db.collection("likes").deleteOne({
+          postId: id,
+          userId: new ObjectId(userId),
+        });
+
+        await db
+          .collection("posts")
+          .updateOne({ _id: new ObjectId(id) }, { $inc: { likes: -1 } });
+
+        res.json({ success: true, liked: false });
+      } catch (error) {
+        res.status(500).json({ error: error.message });
+      }
+    });
 
     // ============= ADMIN REVIEW MANAGEMENT =============
 
     // GET - Get all reviews with filters (Admin only)
-    app.get("/admin/reviews", authenticateToken, isAdmin, async (req, res) => {
+    api.get("/admin/reviews", authenticateToken, isAdmin, async (req, res) => {
       try {
         const {
           page = 1,
@@ -8067,7 +9648,7 @@ Course: ${course?.title || "N/A"}
           },
         });
       } catch (error) {
-        console.error("Get admin reviews error:", error);
+        logger.error("Get admin reviews error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch reviews",
@@ -8076,7 +9657,7 @@ Course: ${course?.title || "N/A"}
     });
 
     // PATCH - Approve review (Admin/Instructor)
-    app.patch(
+    api.patch(
       "/admin/reviews/:reviewId/approve",
       authenticateToken,
       async (req, res) => {
@@ -8134,7 +9715,7 @@ Course: ${course?.title || "N/A"}
             review,
           });
         } catch (error) {
-          console.error("Approve review error:", error);
+          logger.error("Approve review error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to approve review",
@@ -8144,7 +9725,7 @@ Course: ${course?.title || "N/A"}
     );
 
     // PATCH - Reject review (Admin/Instructor)
-    app.patch(
+    api.patch(
       "/admin/reviews/:reviewId/reject",
       authenticateToken,
       async (req, res) => {
@@ -8201,7 +9782,7 @@ Course: ${course?.title || "N/A"}
             review,
           });
         } catch (error) {
-          console.error("Reject review error:", error);
+          logger.error("Reject review error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to reject review",
@@ -8211,7 +9792,7 @@ Course: ${course?.title || "N/A"}
     );
 
     // PATCH - Feature/Unfeature review (Admin only)
-    app.patch(
+    api.patch(
       "/admin/reviews/:reviewId/feature",
       authenticateToken,
       isAdmin,
@@ -8241,7 +9822,7 @@ Course: ${course?.title || "N/A"}
             review,
           });
         } catch (error) {
-          console.error("Feature review error:", error);
+          logger.error("Feature review error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to update review feature status",
@@ -8251,7 +9832,7 @@ Course: ${course?.title || "N/A"}
     );
 
     // DELETE - Delete review (Admin only)
-    app.delete(
+    api.delete(
       "/admin/reviews/:reviewId",
       authenticateToken,
       isAdmin,
@@ -8280,7 +9861,7 @@ Course: ${course?.title || "N/A"}
             message: "Review deleted successfully",
           });
         } catch (error) {
-          console.error("Delete review error:", error);
+          logger.error("Delete review error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to delete review",
@@ -8290,7 +9871,7 @@ Course: ${course?.title || "N/A"}
     );
 
     // GET - Course Analytics Overview (Instructor/Admin only)
-    app.get(
+    api.get(
       "/analytics/courses/:courseId",
       authenticateToken,
       async (req, res) => {
@@ -8478,7 +10059,7 @@ Course: ${course?.title || "N/A"}
             },
           });
         } catch (error) {
-          console.error("Analytics error:", error);
+          logger.error("Analytics error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to fetch analytics",
@@ -8488,7 +10069,7 @@ Course: ${course?.title || "N/A"}
     );
 
     // GET - Student Progress Analytics (Instructor/Admin only)
-    app.get(
+    api.get(
       "/analytics/courses/:courseId/students",
       authenticateToken,
       async (req, res) => {
@@ -8564,7 +10145,7 @@ Course: ${course?.title || "N/A"}
             },
           });
         } catch (error) {
-          console.error("Student analytics error:", error);
+          logger.error("Student analytics error:", error);
           res.status(500).json({
             success: false,
             message: "Failed to fetch student analytics",
@@ -8574,7 +10155,7 @@ Course: ${course?.title || "N/A"}
     );
 
     // GET - Instructor Dashboard Analytics (Admin/Instructor)
-    app.get("/analytics/dashboard", authenticateToken, async (req, res) => {
+    api.get("/analytics/dashboard", authenticateToken, async (req, res) => {
       try {
         const userId = req.user.userId;
         const user = await userCollection.findOne({
@@ -8677,7 +10258,7 @@ Course: ${course?.title || "N/A"}
           },
         });
       } catch (error) {
-        console.error("Dashboard analytics error:", error);
+        logger.error("Dashboard analytics error:", error);
         res.status(500).json({
           success: false,
           message: "Failed to fetch dashboard analytics",
@@ -8712,23 +10293,19 @@ Course: ${course?.title || "N/A"}
       return stats;
     }
 
-    // Start server
-    app.listen(PORT, () => {
-      console.log(`Server running on port ${PORT}`);
-    });
-
     // Health check endpoint
-    app.get("/health", (req, res) => {
+    api.get("/health", (req, res) => {
       res.status(200).json({
         success: true,
         message: "Server is running",
         database: "connected",
+        uptime: process.uptime(),
         timestamp: new Date(),
       });
     });
 
     // 404 handler for undefined routes
-    app.use((req, res) => {
+    api.use((req, res) => {
       res.status(404).json({
         success: false,
         message: `Route ${req.method} ${req.path} not found`,
@@ -8736,8 +10313,8 @@ Course: ${course?.title || "N/A"}
     });
 
     // Global error handler
-    app.use((err, req, res, next) => {
-      console.error("Global error:", err);
+    api.use((err, req, res, next) => {
+      logger.error("Global error:", err);
       res.status(500).json({
         success: false,
         message: "Internal server error",
@@ -8745,29 +10322,58 @@ Course: ${course?.title || "N/A"}
       });
     });
 
-    // START SERVER HERE - AFTER all routes are defined
-    app.listen(PORT, () => {
-      console.log(`Server running on http://localhost:${PORT}`);
-    });
-
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
-    console.log(
+    logger.log(
       "Pinged your deployment. You successfully connected to MongoDB!",
     );
   } catch (error) {
-    console.error("Failed to connect to MongoDB:", error);
+    logger.error("Failed to connect to MongoDB:", error);
     process.exit(1);
   }
 }
 
 // Run the application
-run().catch(console.dir);
+// run().catch(console.dir);
 
-// Handle graceful shutdown
+app.use("/api", api);
+
+// Global Error Handler
+app.use((err, req, res, next) => {
+  logger.error("❌ Global Error:", err);
+
+  res.status(err.status || 500).json({
+    success: false,
+    message:
+      process.env.NODE_ENV === "production"
+        ? "Internal server error"
+        : err.message,
+  });
+});
+
+let server;
+
+run()
+  .then(() => {
+    server = app.listen(PORT, "0.0.0.0", () => {
+      logger.log(`✅ Server running on port ${PORT}`);
+    });
+  })
+  .catch((error) => {
+    logger.error("❌ Failed to start server:", error);
+  });
+
+// Graceful shutdown
 process.on("SIGINT", async () => {
-  console.log("Closing MongoDB connection...");
+  logger.log("🛑 Shutting down gracefully...");
+
+  if (server) {
+    server.close();
+  }
+
   await client.close();
-  console.log("MongoDB connection closed");
+
+  logger.log("✅ MongoDB connection closed");
+
   process.exit(0);
 });
