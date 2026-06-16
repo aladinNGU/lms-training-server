@@ -3015,8 +3015,7 @@ async function run() {
       res.send(`LMS Training server is running on port ${PORT}`);
     });
 
-    // GET all courses
-    // READ all courses with filters
+    // GET all courses with admin access (shows ALL statuses)
     api.get("/courses", async (req, res) => {
       try {
         const {
@@ -3024,17 +3023,25 @@ async function run() {
           limit = 10,
           category,
           level,
-          status,
+          status = "published",
           search,
           sortBy = "createdAt",
           sortOrder = -1,
+          includeAll = false, // ✅ When true, shows ALL courses (admin only)
         } = req.query;
 
         const query = {};
 
+        // ✅ If includeAll is true, show ALL courses (no status filter)
+        // ✅ If includeAll is false, only show published courses
+        if (!includeAll) {
+          query.status = "published";
+        }
+
+        // Apply additional filters
         if (category) query.category = category;
         if (level) query.level = level;
-        if (status) query.status = status;
+        if (status && status !== "all") query.status = status;
         if (search) {
           query.$or = [
             { title: { $regex: search, $options: "i" } },
