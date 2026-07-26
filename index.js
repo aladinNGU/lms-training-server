@@ -265,6 +265,8 @@ async function run() {
     const testimonialCollection = db.collection("testimonials");
     const contactCollection = db.collection("contacts");
     const reviewCollection = db.collection("reviews");
+    const consultations = db.collection("consultations");
+    const webdevContact = db.collection("webdevContact");
     // ============= Blog Post Collections =============
     const postCollection = db.collection("posts");
     const commentCollection = db.collection("comments");
@@ -343,6 +345,12 @@ async function run() {
     await reviewCollection.createIndex({ courseId: 1, createdAt: -1 });
     await reviewCollection.createIndex({ rating: -1 });
     await reviewCollection.createIndex({ isApproved: 1 });
+
+    // Run this in MongoDB shell or Compass
+    await consultations.createIndex({ createdAt: -1 });
+    await consultations.createIndex({ status: 1 });
+    await consultations.createIndex({ email: 1 });
+    await consultations.createIndex({ service: 1 });
 
     // Middleware to check if user is admin
     async function isAdmin(req, res, next) {
@@ -435,6 +443,59 @@ async function run() {
 
     // ============= HELPER FUNCTIONS =============
     // Helper function to generate unique invoice number
+    // Add this helper function at the top of your routes file
+    const getServiceDisplayName = (serviceValue) => {
+      const serviceMap = {
+        "website-development": "Website Development",
+        "web-application": "Web Application",
+        "meta-ads": "Meta Ads",
+        seo: "SEO",
+        "ai-solution": "AI Solution",
+        "smm-panel": "SMM Panel",
+        "programming-course": "Programming Course",
+        other: "Other",
+      };
+      return serviceMap[serviceValue] || serviceValue;
+    };
+
+    // Helper function for webdev service display names
+    const getWebdevServiceDisplayName = (serviceValue) => {
+      const serviceMap = {
+        "website-development": "Website Development",
+        "web-application": "Web Application",
+        "ecommerce-website": "eCommerce Website",
+        "admin-dashboard": "Admin Dashboard",
+        "erp-crm-system": "ERP / CRM System",
+        lms: "LMS",
+        "api-development": "API Development",
+        "ui-ux-design": "UI/UX Design",
+        other: "Other",
+      };
+      return serviceMap[serviceValue] || serviceValue;
+    };
+
+    // Helper function for budget display
+    const getBudgetDisplay = (budgetValue) => {
+      const budgetMap = {
+        "under-500": "Under $500",
+        "500-2000": "$500 – $2,000",
+        "2000-5000": "$2,000 – $5,000",
+        "5000-plus": "$5,000+",
+        "lets-discuss": "Let's Discuss",
+      };
+      return budgetMap[budgetValue] || budgetValue;
+    };
+
+    // Helper function for timeline display
+    const getTimelineDisplay = (timelineValue) => {
+      const timelineMap = {
+        immediately: "Immediately",
+        "within-1-month": "Within 1 Month",
+        "within-3-months": "Within 3 Months",
+        "just-planning": "Just Planning",
+      };
+      return timelineMap[timelineValue] || timelineValue;
+    };
 
     function checkLoginAttempts(ip, email) {
       const key = `${ip}_${email}`;
@@ -823,6 +884,741 @@ async function run() {
         res.status(500).json({
           success: false,
           error: "Failed to submit contact form. Please try again later.",
+        });
+      }
+    });
+
+    // ===== CONSULTATION ENDPOINT (New for multi-step consultation form) =====
+    api.post("/consultation", async (req, res) => {
+      try {
+        logger.log("📝 Consultation form submission received:", req.body);
+
+        const {
+          // Step 1: Service Selection
+          service,
+
+          // Step 2: Business Information
+          businessName,
+          website,
+          industry,
+          country,
+
+          // Step 3: Project Details
+          projectDescription,
+          goals,
+          timeline,
+          budget,
+
+          // Step 4: Contact Information
+          name,
+          email,
+          phone,
+          preferredContact,
+
+          // Step 5: Schedule
+          meetingPlatform,
+
+          recaptchaToken,
+        } = req.body;
+
+        // ===== 1. VALIDATION =====
+        // Step 1: Service Selection
+        if (!service) {
+          return res.status(400).json({
+            success: false,
+            error: "Please select a service",
+          });
+        }
+
+        // Step 2: Business Information
+        if (!businessName) {
+          return res.status(400).json({
+            success: false,
+            error: "Business name is required",
+          });
+        }
+        if (!industry) {
+          return res.status(400).json({
+            success: false,
+            error: "Industry is required",
+          });
+        }
+        if (!country) {
+          return res.status(400).json({
+            success: false,
+            error: "Country is required",
+          });
+        }
+
+        // Step 3: Project Details
+        if (!projectDescription) {
+          return res.status(400).json({
+            success: false,
+            error: "Project description is required",
+          });
+        }
+        if (!goals) {
+          return res.status(400).json({
+            success: false,
+            error: "Goals are required",
+          });
+        }
+        if (!timeline) {
+          return res.status(400).json({
+            success: false,
+            error: "Timeline is required",
+          });
+        }
+        if (!budget) {
+          return res.status(400).json({
+            success: false,
+            error: "Budget is required",
+          });
+        }
+
+        // Step 4: Contact Information
+        if (!name) {
+          return res.status(400).json({
+            success: false,
+            error: "Name is required",
+          });
+        }
+        if (!email) {
+          return res.status(400).json({
+            success: false,
+            error: "Email is required",
+          });
+        }
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid email format",
+          });
+        }
+        if (!phone) {
+          return res.status(400).json({
+            success: false,
+            error: "Phone number is required",
+          });
+        }
+        if (!preferredContact) {
+          return res.status(400).json({
+            success: false,
+            error: "Preferred contact method is required",
+          });
+        }
+
+        // Step 5: Schedule
+        if (!meetingPlatform) {
+          return res.status(400).json({
+            success: false,
+            error: "Please select a meeting platform",
+          });
+        }
+
+        // ===== 2. RECAPTCHA VERIFICATION (Production only) =====
+        if (process.env.NODE_ENV === "production") {
+          if (!recaptchaToken) {
+            return res.status(400).json({
+              success: false,
+              error: "reCAPTCHA verification required",
+            });
+          }
+
+          const isRecaptchaValid = await verifyRecaptcha(recaptchaToken);
+          if (!isRecaptchaValid) {
+            return res.status(400).json({
+              success: false,
+              error: "reCAPTCHA verification failed. Please try again.",
+            });
+          }
+        }
+
+        // ===== 3. RATE LIMITING =====
+        const ip = req.ip || req.connection.remoteAddress;
+        const rateLimitKey = `consultation_${ip}`;
+
+        if (!global.consultationRateLimit)
+          global.consultationRateLimit = new Map();
+        const now = Date.now();
+        const userAttempts =
+          global.consultationRateLimit.get(rateLimitKey) || [];
+        const recentAttempts = userAttempts.filter((t) => now - t < 3600000);
+
+        if (recentAttempts.length >= 3) {
+          return res.status(429).json({
+            success: false,
+            error: "Too many consultation requests. Please try again later.",
+          });
+        }
+
+        recentAttempts.push(now);
+        global.consultationRateLimit.set(rateLimitKey, recentAttempts);
+
+        // ===== 4. SAVE TO DATABASE =====
+        // const db = client.db("lmsDB");
+        // const consultations = db.collection("consultations");
+
+        const consultationData = {
+          // Step 1: Service Selection
+          service: service,
+          serviceDisplayName: getServiceDisplayName(service),
+
+          // Step 2: Business Information
+          businessName,
+          website: website || "",
+          industry,
+          country,
+
+          // Step 3: Project Details
+          projectDescription,
+          goals,
+          timeline,
+          budget,
+
+          // Step 4: Contact Information
+          name,
+          email,
+          phone,
+          preferredContact,
+
+          // Step 5: Schedule
+          meetingPlatform,
+
+          // Metadata
+          type: "consultation",
+          status: "pending",
+          createdAt: new Date(),
+          userAgent: req.headers["user-agent"],
+          ip: req.ip || req.connection.remoteAddress,
+        };
+
+        logger.log("💾 Saving consultation to database:", consultationData);
+        const result = await consultations.insertOne(consultationData);
+        logger.log("✅ Consultation saved with ID:", result.insertedId);
+
+        // ===== 5. SEND EMAILS (Non-blocking) =====
+        let emailSent = false;
+        const serviceDisplayName = getServiceDisplayName(service);
+
+        if (transporter && process.env.EMAIL_USER) {
+          // Send acknowledgment email to user
+          transporter
+            .sendMail({
+              from: `"BD Programming" <${process.env.EMAIL_USER}>`,
+              to: email,
+              subject: "🎉 Your Free Consultation Request Received!",
+              html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <div style="background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
+                <h1 style="color: white; margin: 0;">🎉 Consultation Request Received!</h1>
+              </div>
+              <div style="background: #f9fafb; padding: 30px; border-radius: 0 0 10px 10px;">
+                <p>Dear <strong>${name}</strong>,</p>
+                <p>Thank you for requesting a free consultation with BD Programming. We're excited to help you achieve your goals!</p>
+                
+                <div style="background: #e5e7eb; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                  <h3 style="margin-top: 0; color: #6366f1;">Your Consultation Details:</h3>
+                  <p><strong>Service:</strong> ${serviceDisplayName}</p>
+                  <p><strong>Business:</strong> ${businessName}</p>
+                  <p><strong>Industry:</strong> ${industry}</p>
+                  <p><strong>Preferred Contact:</strong> ${preferredContact}</p>
+                  <p><strong>Meeting Platform:</strong> ${meetingPlatform}</p>
+                </div>
+
+                <div style="background: #dbeafe; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #6366f1;">
+                  <p style="margin: 0; color: #1e40af;"><strong>📅 Next Steps:</strong></p>
+                  <p style="margin: 5px 0 0 0; color: #1e40af;">Our team will contact you within 24 hours to schedule your strategy session.</p>
+                </div>
+
+                <p>In the meantime, feel free to explore our <a href="${process.env.FRONTEND_URL}/services" style="color: #6366f1;">services page</a> to learn more about what we offer.</p>
+                
+                <p>Best regards,<br><strong>BD Programming Support Team</strong></p>
+              </div>
+              <div style="text-align: center; padding: 20px; font-size: 12px; color: #6b7280;">
+                <p>© ${new Date().getFullYear()} BD Programming. All rights reserved.</p>
+              </div>
+            </div>
+          `,
+            })
+            .then(() => {
+              logger.log(
+                "✅ Consultation acknowledgment email sent to user:",
+                email,
+              );
+              emailSent = true;
+            })
+            .catch((err) =>
+              logger.error("❌ Consultation email error:", err.message),
+            );
+
+          // Send admin notification
+          transporter
+            .sendMail({
+              from: `"BD Programming Consultation" <${process.env.EMAIL_USER}>`,
+              to: process.env.ADMIN_EMAIL || "teams.rcsbd@gmail.com",
+              subject: `🔔 New Consultation Request: ${serviceDisplayName}`,
+              html: `
+            <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto;">
+              <div style="background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); padding: 20px; text-align: center; border-radius: 10px 10px 0 0;">
+                <h2 style="color: white; margin: 0;">🔔 New Consultation Request</h2>
+              </div>
+              <div style="background: #f9fafb; padding: 20px; border-radius: 0 0 10px 10px;">
+                <div style="background: #dbeafe; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #6366f1;">
+                  <p style="margin: 0; color: #1e40af;"><strong>Priority:</strong> New Consultation</p>
+                  <p style="margin: 5px 0 0 0; color: #1e40af;"><strong>Time:</strong> ${new Date().toLocaleString()}</p>
+                </div>
+
+                <h3 style="color: #6366f1; border-bottom: 1px solid #e5e7eb; padding-bottom: 10px;">Service Details</h3>
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                  <tr><td style="padding: 8px 0;"><strong>Service:</strong></td><td>${serviceDisplayName}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Business:</strong></td><td>${businessName}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Website:</strong></td><td>${website || "Not provided"}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Industry:</strong></td><td>${industry}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Country:</strong></td><td>${country}</td></tr>
+                </table>
+
+                <h3 style="color: #6366f1; border-bottom: 1px solid #e5e7eb; padding-bottom: 10px;">Project Details</h3>
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                  <tr><td style="padding: 8px 0;"><strong>Description:</strong></td><td>${projectDescription}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Goals:</strong></td><td>${goals}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Timeline:</strong></td><td>${timeline}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Budget:</strong></td><td>${budget}</td></tr>
+                </table>
+
+                <h3 style="color: #6366f1; border-bottom: 1px solid #e5e7eb; padding-bottom: 10px;">Contact Information</h3>
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                  <tr><td style="padding: 8px 0;"><strong>Name:</strong></td><td>${name}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Email:</strong></td><td>${email}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Phone:</strong></td><td>${phone}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Preferred Contact:</strong></td><td>${preferredContact}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Meeting Platform:</strong></td><td>${meetingPlatform}</td></tr>
+                </table>
+
+                <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
+                  <a href="${process.env.FRONTEND_URL}/admin/consultations/${result.insertedId}" style="background: #6366f1; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">View in Admin Panel</a>
+                </div>
+              </div>
+            </div>
+          `,
+            })
+            .then(() => logger.log("✅ Consultation admin notification sent"))
+            .catch((err) =>
+              logger.error("❌ Consultation admin email error:", err.message),
+            );
+        } else {
+          logger.warn(
+            "⚠️ Email transporter not configured. Skipping email notifications.",
+          );
+        }
+
+        // ===== 6. SUCCESS RESPONSE =====
+        res.status(201).json({
+          success: true,
+          message:
+            "🎉 Your consultation request has been submitted successfully! Our team will contact you within 24 hours.",
+          consultationId: result.insertedId,
+          emailSent: emailSent,
+        });
+      } catch (error) {
+        logger.error("❌ Consultation form error:", error);
+        res.status(500).json({
+          success: false,
+          error:
+            "Failed to submit consultation request. Please try again later.",
+        });
+      }
+    });
+
+    // ===== WEBDEV CONTACT ENDPOINT =====
+    api.post("/webdevcontact", async (req, res) => {
+      try {
+        logger.log("📝 WebDev project inquiry received:", req.body);
+
+        const {
+          // Step 1: Service Selection
+          service,
+
+          // Step 2: Project Information
+          projectName,
+          companyName,
+          industry,
+          country,
+          website,
+
+          // Step 3: Project Description
+          projectDescription,
+          problem,
+          requiredFeatures,
+          preferredTech,
+          targetUsers,
+
+          // Step 4: Budget
+          budget,
+
+          // Step 5: Timeline
+          timeline,
+
+          // Step 6: Contact Information
+          name,
+          email,
+          phone,
+          whatsapp,
+          preferredContact,
+
+          // Step 7: Schedule
+          meetingPlatform,
+
+          recaptchaToken,
+        } = req.body;
+
+        // ===== 1. VALIDATION =====
+        // Step 1: Service Selection
+        if (!service) {
+          return res.status(400).json({
+            success: false,
+            error: "Please select a service",
+          });
+        }
+
+        // Step 2: Project Information
+        if (!projectName) {
+          return res.status(400).json({
+            success: false,
+            error: "Project name is required",
+          });
+        }
+        if (!companyName) {
+          return res.status(400).json({
+            success: false,
+            error: "Company name is required",
+          });
+        }
+        if (!industry) {
+          return res.status(400).json({
+            success: false,
+            error: "Industry is required",
+          });
+        }
+        if (!country) {
+          return res.status(400).json({
+            success: false,
+            error: "Country is required",
+          });
+        }
+
+        // Step 3: Project Description
+        if (!projectDescription) {
+          return res.status(400).json({
+            success: false,
+            error: "Project description is required",
+          });
+        }
+        if (!problem) {
+          return res.status(400).json({
+            success: false,
+            error: "Problem description is required",
+          });
+        }
+        if (!requiredFeatures) {
+          return res.status(400).json({
+            success: false,
+            error: "Required features are required",
+          });
+        }
+        if (!targetUsers) {
+          return res.status(400).json({
+            success: false,
+            error: "Target users are required",
+          });
+        }
+
+        // Step 4: Budget
+        if (!budget) {
+          return res.status(400).json({
+            success: false,
+            error: "Budget selection is required",
+          });
+        }
+
+        // Step 5: Timeline
+        if (!timeline) {
+          return res.status(400).json({
+            success: false,
+            error: "Timeline selection is required",
+          });
+        }
+
+        // Step 6: Contact Information
+        if (!name) {
+          return res.status(400).json({
+            success: false,
+            error: "Name is required",
+          });
+        }
+        if (!email) {
+          return res.status(400).json({
+            success: false,
+            error: "Email is required",
+          });
+        }
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid email format",
+          });
+        }
+        if (!phone) {
+          return res.status(400).json({
+            success: false,
+            error: "Phone number is required",
+          });
+        }
+        if (!whatsapp) {
+          return res.status(400).json({
+            success: false,
+            error: "WhatsApp number is required",
+          });
+        }
+        if (!preferredContact) {
+          return res.status(400).json({
+            success: false,
+            error: "Preferred contact method is required",
+          });
+        }
+
+        // Step 7: Schedule
+        if (!meetingPlatform) {
+          return res.status(400).json({
+            success: false,
+            error: "Please select a meeting platform",
+          });
+        }
+
+        // ===== 2. RECAPTCHA VERIFICATION (Production only) =====
+        if (process.env.NODE_ENV === "production") {
+          if (!recaptchaToken) {
+            return res.status(400).json({
+              success: false,
+              error: "reCAPTCHA verification required",
+            });
+          }
+
+          const isRecaptchaValid = await verifyRecaptcha(recaptchaToken);
+          if (!isRecaptchaValid) {
+            return res.status(400).json({
+              success: false,
+              error: "reCAPTCHA verification failed. Please try again.",
+            });
+          }
+        }
+
+        // ===== 3. RATE LIMITING =====
+        const ip = req.ip || req.connection.remoteAddress;
+        const rateLimitKey = `webdev_${ip}`;
+
+        if (!global.webdevRateLimit) global.webdevRateLimit = new Map();
+        const now = Date.now();
+        const userAttempts = global.webdevRateLimit.get(rateLimitKey) || [];
+        const recentAttempts = userAttempts.filter((t) => now - t < 3600000);
+
+        if (recentAttempts.length >= 3) {
+          return res.status(429).json({
+            success: false,
+            error: "Too many project inquiries. Please try again later.",
+          });
+        }
+
+        recentAttempts.push(now);
+        global.webdevRateLimit.set(rateLimitKey, recentAttempts);
+
+        // ===== 4. SAVE TO DATABASE =====
+        // const db = client.db("lmsDB");
+        // const webdevProjects = db.collection("webdev_projects");
+
+        const projectData = {
+          // Step 1: Service
+          service: service,
+          serviceDisplayName: getWebdevServiceDisplayName(service),
+
+          // Step 2: Project Information
+          projectName,
+          companyName,
+          industry,
+          country,
+          website: website || "",
+
+          // Step 3: Project Description
+          projectDescription,
+          problem,
+          requiredFeatures,
+          preferredTech: preferredTech || "",
+          targetUsers,
+
+          // Step 4: Budget
+          budget,
+          budgetDisplay: getBudgetDisplay(budget),
+
+          // Step 5: Timeline
+          timeline,
+          timelineDisplay: getTimelineDisplay(timeline),
+
+          // Step 6: Contact Information
+          name,
+          email,
+          phone,
+          whatsapp,
+          preferredContact,
+
+          // Step 7: Schedule
+          meetingPlatform,
+
+          // Metadata
+          type: "webdev_project",
+          status: "pending",
+          createdAt: new Date(),
+          userAgent: req.headers["user-agent"],
+          ip: req.ip || req.connection.remoteAddress,
+        };
+
+        logger.log("💾 Saving webdev project to database:", projectData);
+        const result = await webdevContact.insertOne(projectData);
+        logger.log("✅ Webdev project saved with ID:", result.insertedId);
+
+        // ===== 5. SEND EMAILS (Non-blocking) =====
+        let emailSent = false;
+        const serviceDisplayName = getWebdevServiceDisplayName(service);
+
+        if (transporter && process.env.EMAIL_USER) {
+          // Send acknowledgment email to user
+          transporter
+            .sendMail({
+              from: `"BD Programming" <${process.env.EMAIL_USER}>`,
+              to: email,
+              subject: "🚀 Your Project Request Has Been Received!",
+              html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <div style="background: linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%); padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
+                <h1 style="color: white; margin: 0;">🚀 Project Request Received!</h1>
+              </div>
+              <div style="background: #f9fafb; padding: 30px; border-radius: 0 0 10px 10px;">
+                <p>Dear <strong>${name}</strong>,</p>
+                <p>Thank you for submitting your project request to BD Programming. We're excited to help you build something amazing!</p>
+                
+                <div style="background: #e5e7eb; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                  <h3 style="margin-top: 0; color: #3b82f6;">Project Details:</h3>
+                  <p><strong>Service:</strong> ${serviceDisplayName}</p>
+                  <p><strong>Project:</strong> ${projectName}</p>
+                  <p><strong>Company:</strong> ${companyName}</p>
+                  <p><strong>Budget:</strong> ${getBudgetDisplay(budget)}</p>
+                  <p><strong>Timeline:</strong> ${getTimelineDisplay(timeline)}</p>
+                </div>
+
+                <div style="background: #dbeafe; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3b82f6;">
+                  <p style="margin: 0; color: #1e40af;"><strong>📅 Next Steps:</strong></p>
+                  <p style="margin: 5px 0 0 0; color: #1e40af;">Our team will contact you within 24 hours to discuss your project in detail.</p>
+                </div>
+
+                <p>Best regards,<br><strong>BD Programming Team</strong></p>
+              </div>
+              <div style="text-align: center; padding: 20px; font-size: 12px; color: #6b7280;">
+                <p>© ${new Date().getFullYear()} BD Programming. All rights reserved.</p>
+              </div>
+            </div>
+          `,
+            })
+            .then(() => {
+              logger.log("✅ Webdev acknowledgment email sent to user:", email);
+              emailSent = true;
+            })
+            .catch((err) =>
+              logger.error("❌ Webdev email error:", err.message),
+            );
+
+          // Send admin notification
+          transporter
+            .sendMail({
+              from: `"BD Programming Projects" <${process.env.EMAIL_USER}>`,
+              to: process.env.ADMIN_EMAIL || "teams.rcsbd@gmail.com",
+              subject: `🔔 New Project Request: ${serviceDisplayName} - ${projectName}`,
+              html: `
+            <div style="font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto;">
+              <div style="background: linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%); padding: 20px; text-align: center; border-radius: 10px 10px 0 0;">
+                <h2 style="color: white; margin: 0;">🔔 New Web Development Project Request</h2>
+              </div>
+              <div style="background: #f9fafb; padding: 20px; border-radius: 0 0 10px 10px;">
+                <div style="background: #dbeafe; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #3b82f6;">
+                  <p style="margin: 0; color: #1e40af;"><strong>Priority:</strong> New Project Inquiry</p>
+                  <p style="margin: 5px 0 0 0; color: #1e40af;"><strong>Time:</strong> ${new Date().toLocaleString()}</p>
+                </div>
+
+                <h3 style="color: #3b82f6; border-bottom: 1px solid #e5e7eb; padding-bottom: 10px;">Service Details</h3>
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                  <tr><td style="padding: 8px 0;"><strong>Service:</strong></td><td>${serviceDisplayName}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Project Name:</strong></td><td>${projectName}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Company:</strong></td><td>${companyName}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Industry:</strong></td><td>${industry}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Country:</strong></td><td>${country}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Website:</strong></td><td>${website || "Not provided"}</td></tr>
+                </table>
+
+                <h3 style="color: #3b82f6; border-bottom: 1px solid #e5e7eb; padding-bottom: 10px;">Project Description</h3>
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                  <tr><td style="padding: 8px 0;"><strong>Description:</strong></td><td>${projectDescription}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Problem:</strong></td><td>${problem}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Required Features:</strong></td><td>${requiredFeatures}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Preferred Tech:</strong></td><td>${preferredTech || "Not specified"}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Target Users:</strong></td><td>${targetUsers}</td></tr>
+                </table>
+
+                <h3 style="color: #3b82f6; border-bottom: 1px solid #e5e7eb; padding-bottom: 10px;">Budget & Timeline</h3>
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                  <tr><td style="padding: 8px 0;"><strong>Budget:</strong></td><td>${getBudgetDisplay(budget)}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Timeline:</strong></td><td>${getTimelineDisplay(timeline)}</td></tr>
+                </table>
+
+                <h3 style="color: #3b82f6; border-bottom: 1px solid #e5e7eb; padding-bottom: 10px;">Contact Information</h3>
+                <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                  <tr><td style="padding: 8px 0;"><strong>Name:</strong></td><td>${name}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Email:</strong></td><td>${email}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Phone:</strong></td><td>${phone}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>WhatsApp:</strong></td><td>${whatsapp}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Preferred Contact:</strong></td><td>${preferredContact}</td></tr>
+                  <tr><td style="padding: 8px 0;"><strong>Meeting Platform:</strong></td><td>${meetingPlatform}</td></tr>
+                </table>
+
+                <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
+                  <a href="${process.env.FRONTEND_URL}/admin/webdev-projects/${result.insertedId}" style="background: #3b82f6; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">View in Admin Panel</a>
+                </div>
+              </div>
+            </div>
+          `,
+            })
+            .then(() => logger.log("✅ Webdev admin notification sent"))
+            .catch((err) =>
+              logger.error("❌ Webdev admin email error:", err.message),
+            );
+        } else {
+          logger.warn(
+            "⚠️ Email transporter not configured. Skipping email notifications.",
+          );
+        }
+
+        // ===== 6. SUCCESS RESPONSE =====
+        res.status(201).json({
+          success: true,
+          message:
+            "✅ Your project request has been submitted successfully! Our team will contact you within 24 hours.",
+          projectId: result.insertedId,
+          emailSent: emailSent,
+        });
+      } catch (error) {
+        logger.error("❌ Webdev project form error:", error);
+        res.status(500).json({
+          success: false,
+          error: "Failed to submit project request. Please try again later.",
         });
       }
     });
